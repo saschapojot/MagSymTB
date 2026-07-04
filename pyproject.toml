@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MagSymTB"
+version = "0.1.0"
+description = "Magnetic Symmetry Tight-Binding Model computation package"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+dependencies = [
+    "numpy",
+    "sympy",
+    "scipy",
+    "matplotlib"
+]
+
+[project.scripts]
+# This section creates your command-line tools!
+# Format: "terminal-command = package.module:function"
+mstb-init-from-cif = "magsymtb.cli:run_init_from_cif"
+mstb-general = "magsymtb.cli:run_general"
+
+
+[tool.setuptools.packages.find]
+# This tells the builder that your actual package code is inside 'py_src'
+where = ["py_src"]
