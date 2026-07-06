@@ -8,6 +8,7 @@ from pathlib import Path
 import sympy as sp
 import pickle
 import base64
+from multiprocessing import Pool
 import scipy.linalg
 import argparse
 
@@ -18,6 +19,8 @@ from magsymtb.parse_files.parse_conf import parse_configuration
 from magsymtb.parse_files.sanity_check import run_sanity_check
 from magsymtb.symmetry.generate_magnetic_space_group_representations import generate_representations
 from magsymtb.symmetry.complete_orbitals import run_complete_orbitals
+from magsymtb.classes.class_defs import frac_to_cartesian, atomIndex, hopping, vertex, T_tilde_total
+
 
 sp.init_printing(use_unicode=False, wrap_line=False)
 
@@ -25,6 +28,7 @@ err_representation=12
 err_orbital_completion=13
 save_err_code = 30
 # this script computes for magnetic space group system
+
 
 def load_and_validate_config(confFileName):
     """
@@ -104,6 +108,3545 @@ def load_and_validate_config(confFileName):
     print("Sanity check passed!")
 
     return parsed_config
+
+
+
+
+# ==============================================================================
+# Helper Functions for computation
+# ==============================================================================
+
+def get_rotation_translation(magnetic_space_group_cart_spatial, operation_idx):
+    """
+    Extract rotation/reflection matrix R and translation vector t from a space group operation.
+
+    The magnetic space group operation is in the form [R|t], represented as a 3×4 matrix:
+        [R | t] = [R00 R01 R02 | t0]
+                  [R10 R11 R12 | t1]
+                  [R20 R21 R22 | t2]
+
+    The operation transforms a position vector r as: r' = R @ r + t
+
+    Args:
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian coordinates
+                                 using cif origin (shape: num_ops × 3 × 4)
+        operation_idx: Index of the magnetic space group operation
+
+    Returns:
+        tuple: (R, t)
+            - R (ndarray): 3×3 rotation/reflection matrix
+            - t (ndarray): 3D translation vector
+    """
+    operation = magnetic_space_group_cart_spatial[operation_idx]
+    R = operation[:3, :3]  # Rotation/reflection part
+    t = operation[:3, 3]  # Translation part
+
+    return R, t
+
+
+def generate_wyckoff_orbit(wyckoff_position, magnetic_space_group_cart_spatial, lattice_basis,origin_cart,
+                           tolerance=1e-3):
+    """
+    Generate all symmetry-equivalent positions (orbit) from a single Wyckoff position.
+    Applies all magnetic space group operations' spatial parts to a Wyckoff position and collects unique
+    atomic positions within the unit cell. This generates the complete orbit of
+    the Wyckoff position under the magnetic space group.
+    For each spatial operation [R|t], the transformation is:
+        r' = R @ r + t
+    where r is in fractional coordinates of the primitive cell.
+    Positions that differ by a lattice vector are considered equivalent,
+    so we reduce all positions to the range [0, 1) in fractional coordinates.
+    Args:
+        wyckoff_position: dict from parsed_config['Wyckoff_positions']
+                         Must contain 'fractional_coordinates' key
+                         Example: {'position_name': 'V0',
+                                    'orbitals': ['3dxy', '3dyz', '3dxz']
+                                  'fractional_coordinates':  [0.0, 0.5, 0.0]}
+        magnetic_space_group_cart_spatial: List of spatial parts of magnetic space group matrices in Cartesian coordinates
+                                using cif origin [0,0,0] (shape: num_ops × 3 × 4)
+        lattice_basis: Primitive lattice basis vectors (3×3 array, each row is a basis vector)
+                        expressed in Cartesian coordinates using cif origin
+        tolerance: Numerical tolerance for identifying duplicate positions (default: 1e-3)
+
+    Returns: list of dicts: Each dict contains:
+            - 'fractional_coordinates': [f0, f1, f2] in range [0, 1)
+            - 'cartesian_coordinates': [x, y, z] in Cartesian coords (cif origin)
+            - 'operation_idx': which space group operation generated this position
+            - 'position_name': inherited from input Wyckoff position
+
+    """
+    # Extract input position in fractional coordinates
+    r_frac_input = np.array(wyckoff_position['fractional_coordinates'])
+    position_name = wyckoff_position['position_name']
+    # Convert lattice basis to proper array and get transformation matrices
+    lattice_basis = np.array(lattice_basis)  # rows are basis vectors
+    lattice_matrix = np.column_stack(lattice_basis)  # Columns are basis vectors
+    lattice_matrix_inv = np.linalg.inv(lattice_matrix)
+    # Convert input fractional coordinates to Cartesian using cif origin
+    r_cart_input = frac_to_cartesian([0, 0, 0], r_frac_input, lattice_basis, origin_cart)
+    # Store unique positions
+    unique_positions = []
+    unique_frac_coords = []  # For deduplication
+    # Apply each space group operation
+    for op_idx, operation in enumerate(magnetic_space_group_cart_spatial):
+        # Extract rotation and translation
+        R, t = get_rotation_translation(magnetic_space_group_cart_spatial, op_idx)
+
+        # Apply symmetry operation in Cartesian coordinates
+        # r_cart' = R @ r_cart + t
+        r_cart_transformed = R @ r_cart_input + t
+        # Convert back to fractional coordinates
+        r_frac_transformed = lattice_matrix_inv @ r_cart_transformed
+        # Wrap to [0, 1) to stay within unit cell
+        r_frac_wrapped = r_frac_transformed % 1.0
+        # Check if this position is already in our list (within tolerance)
+        is_duplicate = False
+        for existing_frac in unique_frac_coords:
+            # Check if positions are equivalent (accounting for periodic boundary conditions)
+            diff = r_frac_wrapped - existing_frac
+            if np.linalg.norm(diff) < tolerance:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            # Add to unique positions
+            unique_frac_coords.append(r_frac_wrapped)
+
+            # Convert wrapped fractional back to Cartesian for output
+            r_cart_final = frac_to_cartesian([0, 0, 0], r_frac_wrapped, lattice_basis, origin_cart)
+
+            # Create position dictionary
+            position_dict = {
+                'fractional_coordinates': r_frac_wrapped.tolist(),
+                'cartesian_coordinates': r_cart_final.tolist(),
+                'operation_idx': op_idx,
+                'position_name': position_name,
+            }
+            unique_positions.append(position_dict)
+
+    return unique_positions
+
+
+def generate_atoms_in_unit_cell(parsed_config,magnetic_space_group_cart_spatial, lattice_basis,origin_cart,
+                                repr_s, repr_p, repr_d, repr_f,
+                                spinor_mat_representation,delta_vec,
+                                tolerance=1e-3):
+    """
+    Generates all atoms in the unit cell by expanding the Wyckoff positions defined
+    in the configuration using the provided magnetic space group operations.
+    Args:
+        parsed_config: Dictionary containing configuration (Wyckoff positions, origin, etc.)
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian coordinates
+        lattice_basis: 3x3 array of lattice basis vectors (each row is a basis vector)
+        origin_cart: [0,0,0]
+        repr_s, repr_p, repr_d, repr_f: Orbital representation matrices (numpy arrays)
+        spinor_mat_representation: representation on spinors, time reversal considered
+        delta_vec: delta values indicating whether a magnetic space group operation has time reversal,
+                    1 means no time reversal, -1 means time reversal
+        tolerance: Numerical tolerance for coordinate comparisons
+
+    Returns: A list of atomIndex objects representing all atoms in the unit cell [0,0,0]
+
+    """
+    unit_cell_atoms = []
+    # Iterate over all Wyckoff positions defined in the configuration
+    for wyckoff_pos in parsed_config['Wyckoff_positions']:
+        # Generate the full orbit (all equivalent atoms in unit cell)
+        # This function applies magnetic space group spatial part operations to the Wyckoff generator
+        orbit = generate_wyckoff_orbit(
+            wyckoff_pos,
+            magnetic_space_group_cart_spatial,
+            lattice_basis,
+            origin_cart,
+            tolerance
+        )
+        # Create atomIndex objects for each position in the orbit
+        for index, pos_data in enumerate(orbit):
+            atom = atomIndex(
+                cell=[0, 0, 0],  # Always the home unit cell
+                frac_coord=pos_data['fractional_coordinates'],
+                position_name=pos_data['position_name'],
+                basis=lattice_basis,
+                origin_cart=origin_cart,
+                parsed_config=parsed_config,
+                repr_s_np=repr_s,
+                repr_p_np=repr_p,
+                repr_d_np=repr_d,
+                repr_f_np=repr_f,
+                spinor_mat_representation=spinor_mat_representation,
+                delta_vec=delta_vec
+            )
+            wyckoff_instance_id_tmp = atom.position_name + "_" + str(index)
+            atom.wyckoff_instance_id = wyckoff_instance_id_tmp
+            unit_cell_atoms.append(atom)
+    return unit_cell_atoms
+
+
+def compute_dist(center_atom, unit_cell_atoms, radius, search_range=10):
+    """
+    Find all atoms within a specified radius of a center atom by searching neighboring cells.
+    Returns constructed atomIndex objects for all neighbors found. The neighboring atom types are determined by
+    unit_cell_atoms.
+    Args:
+        center_atom:  atomIndex object for the center atom
+        unit_cell_atoms:  list of atomIndex objects in the reference unit cell [0,0,0]
+        radius:  cutoff distance in Cartesian coordinates (REQUIRED)
+        search_range:  ow many cells to search in each direction (default: 10)
+
+    Returns:
+        list: atomIndex objects within the specified radius, sorted by distance
+
+    """
+    neighbor_atoms = []
+    center_cart = center_atom.cart_coord
+    lattice_basis = center_atom.basis
+    origin_cart = center_atom.origin_cart
+    # Define the full search span
+    full_span = range(-search_range, search_range + 1)
+    n0_range = full_span
+    n1_range = full_span
+    n2_range = full_span
+    # Search through neighboring cells
+    for n0 in n0_range:
+        for n1 in n1_range:
+            for n2 in n2_range:
+                cell = [n0, n1, n2]
+                # print(f"cell={cell}")
+                # Check each atom in the unit cell
+                for unit_atom in unit_cell_atoms:
+                    # Compute Cartesian coordinates for this atom in the proposed cell
+                    candidate_cart = frac_to_cartesian(cell, unit_atom.frac_coord, lattice_basis, origin_cart)
+                    # print(f"candidate_cart={candidate_cart}")
+                    # Calculate distance
+                    dist = np.linalg.norm(candidate_cart - center_cart)
+                    # print(f"dist={dist}")
+                    # Only construct atom if it passes the distance check
+                    if dist <= radius:
+                        # Create atomIndex for this atom in the current cell with deep copies
+                        # print("creating atom")
+                        neighbor_atom = atomIndex(
+                            cell=deepcopy(cell),
+                            frac_coord=deepcopy(unit_atom.frac_coord),
+                            position_name=unit_atom.position_name,
+                            basis=deepcopy(lattice_basis),
+                            origin_cart=deepcopy(origin_cart),
+                            parsed_config=deepcopy(unit_atom.parsed_config),
+                            repr_s_np=deepcopy(unit_atom.repr_s_np),
+                            repr_p_np=deepcopy(unit_atom.repr_p_np),
+                            repr_d_np=deepcopy(unit_atom.repr_d_np),
+                            repr_f_np=deepcopy(unit_atom.repr_f_np),
+                            spinor_mat_representation=deepcopy(unit_atom.spinor_mat_representation),
+                            delta_vec=deepcopy(unit_atom.delta_vec)
+                        )
+                        neighbor_atom.wyckoff_instance_id = unit_atom.wyckoff_instance_id
+                        neighbor_atoms.append((dist, neighbor_atom))
+    # Sort by distance and return only the atomIndex objects
+    neighbor_atoms.sort(key=lambda x: x[0])
+    return [atom for dist, atom in neighbor_atoms]
+
+
+def find_identity_operation(magnetic_space_group_cart_spatial, spinor_mat_representation, delta_vec, tolerance=1e-9):
+    """
+    Find the index of the identity operation in space group matrices.
+    The identity operation has:
+    - Rotation part: 3×3 identity matrix
+    - Translation part: zero vector
+    - spinor part: 2×2 identity matrix
+    - delta: 1
+    Args:
+        magnetic_space_group_cart_spatial: List or array of  3×4 magnetic space group spatial part matrices [R|t]
+                                 in Cartesian coordinates
+        spinor_mat_representation: a list of spinor representations, each matrix is 2 × 2 unitary matrix
+        delta_vec: a vector of 1 and -1, indicating time reversal
+        tolerance: Numerical tolerance for comparison (default: 1e-9)
+
+    Returns:
+        int: Index of the identity operation
+    Raises:
+        ValueError: If identity operation is not found
+
+    """
+    identity_idx = None
+    for idx in range(len(magnetic_space_group_cart_spatial)):
+        # Extract rotation and translation using helper function
+        R, t = get_rotation_translation(magnetic_space_group_cart_spatial, idx)
+
+        # 1. Check if the rotation matrix is the 3x3 identity matrix
+        is_R_identity = np.allclose(R, np.eye(3), atol=tolerance)
+
+        # 2. Check if the translation vector is the zero vector
+        is_t_zero = np.allclose(t, np.zeros(3), atol=tolerance)
+
+        # 3. Check if the spinor matrix is the 2x2 identity matrix
+        is_spinor_identity = np.allclose(spinor_mat_representation[idx], np.eye(2), atol=tolerance)
+
+        # 4. Check if delta is 1 (no time reversal) using float comparison
+        is_delta_one = np.isclose(delta_vec[idx], 1.0, atol=tolerance)
+
+        # If all conditions are satisfied, this is the identity operation
+        if is_R_identity and is_t_zero and is_spinor_identity and is_delta_one:
+            identity_idx = idx
+            break
+
+    if identity_idx is None:
+        raise ValueError("Identity operation not found in the provided magnetic space group operations.")
+
+    return identity_idx
+
+def print_tree(root, prefix="", is_last=True, show_details=True, max_depth=None, current_depth=0):
+    """
+    Print a constraint tree structure in a visual hierarchical format.
+
+    Args:
+        root: vertex object (root of tree or subtree)
+        prefix: String prefix for indentation (used in recursion)
+        is_last: Boolean indicating if this is the last child (affects connector style)
+        show_details: Whether to show detailed hopping information (default: True)
+        max_depth: Maximum depth to print (None = unlimited, default: None)
+        current_depth: Current depth in recursion (internal use, default: 0)
+
+    Tree Structure Symbols:
+        ╔═══ ROOT     (root node)
+        ├── CHILD    (middle child)
+        └── CHILD    (last child)
+        │           (vertical line for continuation)
+
+    Example Output:
+        ╔═══ ROOT: N[0,0,0] ← N[0,0,0], op=0, d=0.0000
+        ├── CHILD (linear): N[0,0,0] ← N[1,0,0], op=1, d=2.5000
+        ├── CHILD (linear): N[0,0,0] ← N[-1,1,0], op=2, d=2.5000
+        └── CHILD (linear): N[0,0,0] ← N[0,-1,0], op=3, d=2.5000
+    """
+    # Check max depth
+    if max_depth is not None and current_depth > max_depth:
+        return
+
+    # Determine node styling
+    if root.is_root:
+        node_label = "ROOT"
+        connector = "╔═══ "
+        detail_prefix = prefix
+    else:
+        node_label = f"CHILD ({root.type})"
+        connector = "└── " if is_last else "├── "
+        detail_prefix = prefix + ("    " if is_last else "│   ")
+
+    # Build node description
+    hop = root.hopping
+
+    # Basic info: atom types and operation
+    to_cell = f"[{hop.to_atom.n0},{hop.to_atom.n1},{hop.to_atom.n2}]"
+    from_cell = f"[{hop.from_atom.n0},{hop.from_atom.n1},{hop.from_atom.n2}]"
+    basic_info = f"{hop.to_atom.wyckoff_instance_id}{to_cell} ← {hop.from_atom.wyckoff_instance_id}{from_cell}"
+
+    # Print main node line
+    if show_details:
+        print(f"{prefix}{connector}{node_label}: {basic_info}, "
+              f"op={hop.operation_idx}, dist={hop.distance:.4f}")
+    else:
+        print(f"{prefix}{connector}{node_label}: op={hop.operation_idx}")
+
+    # Print additional details if requested and this is root
+    if show_details and root.is_root and current_depth == 0:
+        print(f"{detail_prefix}    ├─ Type: {root.type}")
+        print(f"{detail_prefix}    ├─ Children: {len(root.children)}")
+        print(f"{detail_prefix}    └─ Distance: {hop.distance:.6f}")
+
+    # Recursively print children
+    if root.children:
+        for i, child in enumerate(root.children):
+            is_last_child = (i == len(root.children) - 1)
+
+            # Determine new prefix for children
+            if root.is_root:
+                new_prefix = ""
+            else:
+                new_prefix = prefix + ("    " if is_last else "│   ")
+
+            print_tree(child, new_prefix, is_last_child, show_details, max_depth, current_depth + 1)
+
+
+def print_all_trees(roots_list, show_details=True, max_trees=None, max_depth=None):
+    """
+    Print all constraint trees in a formatted way.
+
+    Args:
+        roots_list: List of root vertex objects
+        show_details: Whether to show detailed information (default: True)
+        max_trees: Maximum number of trees to print (None = all, default: None)
+        max_depth: Maximum depth to print for each tree (None = unlimited, default: None)
+    """
+    print("\n" + "=" * 80)
+    print("CONSTRAINT TREE STRUCTURES")
+    print("=" * 80)
+
+    # CRITICAL FIX: Filter to only include actual roots (is_root == True)
+    # ================================================================
+    # ADD THIS LINE RIGHT HERE - it filters out grafted vertices
+    actual_roots = [root for root in roots_list if root.is_root]
+
+    # Print diagnostic if non-root vertices found in the list
+    if len(actual_roots) < len(roots_list):
+        print(f"\nNote: Input list contained {len(roots_list)} vertices")
+        print(f"      Filtered to {len(actual_roots)} actual roots")
+        print(f"      ({len(roots_list) - len(actual_roots)} vertices were grafted as hermitian children)\n")
+
+    # Use actual_roots instead of roots_list for counting
+    num_trees = len(actual_roots) if max_trees is None else min(max_trees, len(actual_roots))
+
+    for i in range(num_trees):
+        root = actual_roots[i]  # Changed from roots_list[i] to actual_roots[i]
+        hop = root.hopping
+
+        print(f"\n{'─' * 80}")
+        print(f"Tree {i}: Distance = {hop.distance:.6f}, "
+              f"Hopping: {hop.to_atom.position_name} ← {hop.from_atom.position_name}")
+        print(f"{'─' * 80}")
+
+        print_tree(root, show_details=show_details, max_depth=max_depth)
+
+    if max_trees is not None and len(actual_roots) > max_trees:
+        print(f"\n... and {len(actual_roots) - max_trees} more trees")
+
+    print("\n" + "=" * 80)
+
+def cif_plus_translation(R,t,lattice_basis,n_vec,atom_cart):
+    """
+    Apply space group operation with lattice translation to an atom position.
+    Computes the full symmetry transformation:
+        r' = R @ r + t + n₀·a₀ + n₁·a₁ + n₂·a₂
+
+    where:
+        - R @ r is the rotation of the atom position
+        - t is the fractional translation (origin shift) from the cif space group operation
+        - n₀·a₀ + n₁·a₁ + n₂·a₂ is a lattice vector translation
+
+    This is the complete symmetry operation that includes the additional lattice
+    translation
+    Args:
+        R:  3×3 rotation matrix (in Cartesian coordinates, [0,0,0] origin)
+        t:  3D translation vector (in Cartesian coordinates, [0,0,0] origin)
+        lattice_basis:  3×3 array of primitive lattice basis vectors (each row is a basis vector)
+                          expressed in Cartesian coordinates using [0,0,0] origin
+        n_vec: Array [n₀, n₁, n₂] containing integer coefficients for lattice translation
+        atom_cart: 3D Cartesian position of the atom (using [0,0,0] origin)
+
+    Returns:
+            transformed_cart, 3D Cartesian position after applying the full symmetry operation
+    """
+    # Extract the three primitive lattice basis vectors (each row is one basis vector)
+    a0 = lattice_basis[0]  # First primitive basis vector
+    a1 = lattice_basis[1]  # Second primitive basis vector
+    a2 = lattice_basis[2]  # Third primitive basis vector
+    # Extract the integer coefficients for the lattice translation
+    # These determine how many unit cells to shift along each basis direction
+    n0 = n_vec[0]
+    n1 = n_vec[1]
+    n2 = n_vec[2]
+    # Apply the complete symmetry transformation:
+    # 1. R @ atom_cart: Apply rotation to the atom position
+    # 2. + t: Add the cif translation from the space group operation
+    # 3. + n0*a0 + n1*a1 + n2*a2: Add the lattice vector translation
+    #    This is the additional shift needed to preserve center atom invariance
+    transformed_cart = R @ atom_cart + t + n0 * a0 + n1 * a1 + n2 * a2
+    return transformed_cart
+
+def is_lattice_vector(vector, lattice_basis, tolerance=1e-3):
+    """
+    Check if a vector can be expressed as an integer linear combination of lattice basis vectors.
+     A vector v is a lattice vector if:
+        v = n0*a0 + n1*a1 + n2*a2
+    where n0, n1, n2 are integers and a0, a1, a2 are primitive lattice basis vectors.
+    Args:
+        vector:  3D vector to check (Cartesian coordinates)
+        lattice_basis: Primitive lattice basis vectors (3×3 array, each row is a basis vector)
+                      expressed in Cartesian coordinates using cif origin
+        tolerance: Numerical tolerance for checking if coefficients are integers (default: 1e-3)
+
+    Returns:
+        tuple: (is_lattice, n_vector)
+            - is_lattice (bool): True if vector is a lattice vector
+            - n_vector (ndarray): The integer coefficients [n0, n1, n2]
+
+    """
+    # Extract basis vectors (each row is a basis vector)
+    a0, a1, a2 = lattice_basis
+    # Create matrix with basis vectors as columns
+    lattice_matrix = np.column_stack([a0, a1, a2])
+    # Solve: vector = lattice_matrix @ [n0, n1, n2]
+    # So: [n0, n1, n2] = lattice_matrix^(-1) @ vector
+    n_vector_float = np.linalg.solve(lattice_matrix, vector)
+    # Round to nearest integers
+    n_vector = np.round(n_vector_float)
+    # Check if coefficients are integers (within tolerance)
+    is_lattice = np.allclose(n_vector_float, n_vector, atol=tolerance)
+    return is_lattice, n_vector
+
+
+def check_center_invariant(center_atom, operation_idx, magnetic_space_group_cart_spatial,
+                           lattice_basis, tolerance=1e-3):
+    """
+    Check if a center atom is invariant under a specific magnetic space group spatial part operation.
+     An atom is invariant if the symmetry operation maps it to itself, possibly
+     translated by a lattice vector. The actual operation is:
+        r' = R @ r + t + n0*a0 + n1*a1 + n2*a2
+    where n0, n1, n2 are integers and a0, a1, a2 are primitive lattice basis vectors.
+
+    For invariance, we need: r' = r, which means:
+        R @ r + t + n0*a0 + n1*a1 + n2*a2 = r
+        => (R - I) @ r + t = -(n0*a0 + n1*a1 + n2*a2)
+
+    Args:
+        center_atom:  atomIndex object representing the center atom
+        operation_idx: Index of the magnetic space group operation to check
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian coordinates
+                                 using cif origin (shape: num_ops × 3 × 4)
+        lattice_basis: Primitive lattice basis vectors (3×3 array, each row is a basis vector)
+                      expressed in Cartesian coordinates using cif origin
+        tolerance: Numerical tolerance for comparison (default: 1e-3)
+
+
+    Returns:
+        tuple: (is_invariant, n_vector)
+            - is_invariant (bool): True if the atom is invariant under the operation
+            - n_vector (ndarray): The integer coefficients [n0, n1, n2] for lattice translation
+    """
+    # Extract the rotation matrix R and translation vector t from the space group operation
+    R, t =get_rotation_translation(magnetic_space_group_cart_spatial, operation_idx)
+    # Get center atom's Cartesian position (using cif origin)
+    r_center = center_atom.cart_coord
+    # Compute the left-hand side of the invariance equation:
+    # (R - I) @ r + t
+    # For invariance, this must equal -(n0*a0 + n1*a1 + n2*a2) for integer n0, n1, n2
+    lhs = (R - np.eye(3)) @ r_center + t
+    # Check if -lhs can be expressed as an integer linear combination of lattice basis vectors
+    # If yes, then there exists a lattice translation that makes the atom invariant
+    # n_vector contains the integer coefficients [n0, n1, n2]
+    is_invariant, n_vector = is_lattice_vector(-lhs, lattice_basis, tolerance)
+    return is_invariant, n_vector
+
+
+def get_next_for_center(center_atom, seed_atom, center_seed_distance, magnetic_space_group_cart_spatial,
+                        operation_idx, parsed_config, tolerance=1e-3):
+    """
+    Apply a magnetic space group spatial part operation to a seed atom, conditioned on center atom invariance.
+    This function implements a three-step validation process:
+    1. Check if the center atom is invariant under the magnetic space group  spatial operation
+       (usually with lattice translation). This determines the lattice shift n_vec.
+    2. If invariant, apply the SAME operation (with the SAME n_vec) to the seed atom
+        to generate an atom's Cartesian coordinate. This atom should be symmetry-equivalent
+        to the seed atom.
+    3. Verify that the transformed seed maintains the same distance from center.
+
+    Physical Context:
+    Given a seed hopping (center ← seed), this function applies a symmetry operation
+    to generate a potentially equivalent hopping (center ← transformed_seed). The
+    transformed position is only returned if it preserves the hopping distance,
+    confirming it belongs to the same equivalence class, if the atom type also matches
+    Args:
+        center_atom: atomIndex object for the center atom (target of the hopping)
+        seed_atom: atomIndex object for the seed neighbor atom (origin of seed hopping)
+        center_seed_distance:  Pre-computed distance from center to seed atom
+                               (avoids redundant computation across operations)
+        magnetic_space_group_cart_spatial:  List of magnetic space group spatial part matrices in Cartesian coordinates
+                                using cif origin (shape: num_ops × 3 × 4)
+        operation_idx: Index of the magnetic space group operation to apply
+        parsed_config: Configuration dictionary containing lattice_basis
+        tolerance: Numerical tolerance for invariance and distance checks (default: 1e-3)
+        verbose: Whether to print debug information (default: False)
+
+    Returns:
+        numpy.ndarray, numpy.ndarray  or None:
+            - Transformed Cartesian coordinates if:
+              (a) center is invariant under this operation, AND
+              (b) transformation preserves the center-seed distance
+            - None otherwise (operation doesn't generate a valid equivalent hopping)
+    """
+    # ==============================================================================
+    # Extract space magnetic group operation components
+    # ==============================================================================
+    # Get the rotation matrix R and translation vector b from the magnetic space group operation
+    # The operation is represented as [R|b] in Cartesian coordinates
+    R, b = get_rotation_translation(magnetic_space_group_cart_spatial, operation_idx)
+
+    # ==============================================================================
+    # Get lattice basis vectors
+    # ==============================================================================
+    # Extract the primitive lattice basis vectors from configuration
+    # These are the fundamental translation vectors a0, a1, a2 of the crystal
+    lattice_basis = np.array(parsed_config['lattice_basis'])
+    # ==============================================================================
+    # STEP 1: Check center atom invariance
+    # ==============================================================================
+    # Determine if the center atom is invariant under this space group operation,
+    # usually with an additional lattice translation.
+    ## Mathematical condition for invariance:
+    #   R @ r_center + b + n_vec · [a0, a1, a2] = r_center
+    # where n_vec = [n0, n1, n2] are integer coefficients for lattice translation
+    #
+    # This ensures that the symmetry operation preserves the hopping target -
+    # the center atom remains at the same atomic site.
+    #
+    # Returns:
+    #   is_invariant: True if center atom is invariant (with some lattice shift)
+    #   n_vec: The required lattice translation [n0, n1, n2] for invariance
+    is_invariant, n_vec = check_center_invariant(
+        center_atom,
+        operation_idx,
+        magnetic_space_group_cart_spatial,
+        lattice_basis,
+        tolerance
+    )
+    # ==============================================================================
+    # STEP 2: Apply operation to seed atom (only if center is invariant)
+    # ==============================================================================
+    if is_invariant:
+        # Center atom is invariant under this operation (with lattice shift n_vec)
+        # Now apply the SAME complete transformation to the seed atom:
+        #   r_transformed = R @ r_seed + b + n_vec · [a0, a1, a2]
+        #
+        # KEY INSIGHT: We must use the SAME n_vec for the seed!
+        # This ensures the hopping vector (r_center - r_seed) transforms consistently,
+        # preserving the relative geometry of the hopping.
+        ## The transformed position may correspond to an atom that is symmetry-equivalent
+        # to the seed atom (same species, equivalent local environment).
+        seed_cart_coord = seed_atom.cart_coord  # Original seed position
+        # Apply the full symmetry transformation: R @ r + b + lattice_shift
+        # This generates a Cartesian coordinate that may represent a symmetry-equivalent atom
+        next_cart_coord = cif_plus_translation(R, b, lattice_basis, n_vec, seed_cart_coord)
+        # ==============================================================================
+        # STEP 3: Verify the transformation preserves hopping distance (isometry check)
+        # ==============================================================================
+        # Calculate the distance from the transformed position to center
+        # For a valid symmetry operation (isometry), this must equal the original distance
+        new_center_seed_dist = np.linalg.norm(next_cart_coord - center_atom.cart_coord, ord=2)
+        # Check if the hopping distance is preserved
+        # This verifies that: |r_center - (R @ r_seed + b + lattice_shift)| = |r_center - r_seed|
+        dist_is_equal = (np.abs(new_center_seed_dist - center_seed_distance) < tolerance)
+        # Only return the transformed position if distance is preserved
+        # This ensures the generated coordinate represents a symmetry-equivalent atom
+        if dist_is_equal == True:
+            return (deepcopy(next_cart_coord), deepcopy(n_vec))
+        else:
+            # Distance not preserved - this indicates a numerical error or
+            # inconsistency in the symmetry operation (shouldn't happen in practice)
+            return None,None
+
+    else:
+        # ==============================================================================
+        # Center atom is NOT invariant - operation invalid for this hopping
+        # ==============================================================================
+        # The center atom does not map to itself (even with lattice translations)
+        # under this magnetic space group operation. Therefore, abandon this symmetry operation
+        return None,None
+
+
+def search_one_equivalent_atom(seed_atom,target_cart_coord, neighbor_atoms_copy, tolerance=1e-3):
+    """
+    Search for an atom in the neighbor_atoms_copy set whose Cartesian coordinate matches the target.
+    This function is used to find which actual neighbor atom corresponds to a transformed
+    position generated by a symmetry operation. If a match is found, it confirms that
+    the symmetry operation maps the seed atom to an existing neighbor atom.
+    Args:
+        seed_atom: atomIndex object for the seed neighbor atom (origin of seed hopping)
+        target_cart_coord: 3D Cartesian coordinate to search for (numpy array)
+                            This is  the result of applying a symmetry operation
+                            to a seed atom's position
+        neighbor_atoms_copy: set of atomIndex objects representing all neighbors
+                         of a center atom within some cutoff radius
+        tolerance:   Numerical tolerance for coordinate comparison (default: 1e-3)
+                    Two positions are considered identical if their Euclidean distance
+                    is less than this tolerance
+
+
+    Returns:
+        atomIndex or None:
+          - The matching neighbor atom if found (coordinate matches within tolerance)
+            IMPORTANT: Returns a REFERENCE (not a copy) to the atomIndex object in neighbor_atoms
+          - None if no match is found (transformed position doesn't correspond to
+            any actual neighbor atom)
+
+    """
+    # Iterate through all neighbor atoms in the set
+    for neighbor in neighbor_atoms_copy:
+        # Compute Euclidean distance between target position and this neighbor's position
+        distance = np.linalg.norm(target_cart_coord - neighbor.cart_coord, ord=2)
+        # Check if the distance is within tolerance (positions match)
+        if distance < tolerance and seed_atom.position_name == neighbor.position_name:
+            # Return a REFERENCE (pointer in C sense, reference in C++ sense) to the matching neighbor atom
+            # This is NOT a deep copy - it's the same object that exists in neighbor_atoms_copy
+            # This allows the caller to use this reference to remove the atom from neighbor_atoms_copy
+            return neighbor
+    return None
+
+def get_equivalent_sets_for_one_center_atom(center_atom_idx, unit_cell_atoms, all_neighbors,
+                                            magnetic_space_group_cart_spatial, identity_idx,parsed_config,
+                                            tolerance=1e-3):
+    """
+    Partition all neighbors of 1 center atom into equivalence classes based on symmetry.
+    Each equivalence class contains center atom's neighbors related by magnetic space group spatial part operations.
+    Algorithm:
+    ---------
+    1. Pop a seed atom from the remaining neighbors (arbitrary choice)
+    2. Apply all magnetic space group spatial part operations to find symmetry-equivalent neighbors
+    3. Group these equivalent neighbors together into one equivalence class
+    4. Repeat until all neighbors are classified
+
+    CRITICAL: Reference Handling
+    ============================
+    This function works with REFERENCES to atomIndex objects throughout:
+    - neighbor_atoms_copy is a set of references to DEEP-COPIED atomIndex objects
+    - seed_atom = set.pop() returns a reference to one of these copied objects
+    - matched_neighbor from search is also a reference to one of these copied objects
+    - equivalence_classes stores tuples containing references to these copied objects
+
+    Why deep copy all_neighbors[center_atom_idx]?
+    ---------------------------------------------
+    We deep copy to DECOUPLE from the input:
+    1. The input all_neighbors should remain unchanged (it may be used elsewhere)
+    2. We destructively remove atoms from neighbor_atoms_copy as we classify them
+    3. Deep copy creates NEW atomIndex objects (independent of the input)
+    4. After deep copy:
+        - all_neighbors[center_atom_idx] still has all its original atomIndex objects
+        - neighbor_atoms_copy has completely separate atomIndex objects with same data
+        - Modifying neighbor_atoms_copy has NO effect on all_neighbors
+
+    Args:
+        center_atom_idx: Index of the center atom in unit_cell_atoms
+        unit_cell_atoms: List of all atomIndex objects in the unit cell
+        all_neighbors: Dictionary mapping center atom index → list of neighbor atomIndex objects
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian coordinates
+        identity_idx: Index of the identity operation
+        tolerance: Numerical tolerance for comparisons (default: 1e-3)
+
+
+    Returns:
+        List of equivalence classes, where each class is a list of tuples:
+        (matched_neighbor, operation_idx, n_vec)
+        where:
+            - matched_neighbor: REFERENCE to deep-copied atomIndex object
+            - operation_idx: Space group operation that maps seed → matched_neighbor
+            - n_vec: Lattice translation vector [n₀, n₁, n₂] for this transformation
+
+    """
+    # ==============================================================================
+    # Initialize working variables
+    # ==============================================================================
+    # Extract reference to center atom from unit cell
+    # This is a REFERENCE (not copied) - center_atom points to the same object in unit_cell_atoms
+    center_atom = unit_cell_atoms[center_atom_idx]
+    # print(f"center_atom={center_atom}")
+    # Create a working copy of neighbors as a set
+    # IMPORTANT: Deep copy to DECOUPLE from input all_neighbors
+    # ----------------------------------------------------------
+    # Why deep copy?
+    # - We will destructively remove atoms from neighbor_atoms_copy as we classify them
+    # - We must NOT modify the input all_neighbors (caller may need it unchanged)
+    # - Deep copy creates entirely NEW atomIndex objects (different memory addresses)
+    #   with the same data as the originals
+    #
+    # Memory structure after deep copy:
+    # - all_neighbors[center_atom_idx] = [obj_A, obj_B, obj_C, ...]  (original objects)
+    # - neighbor_atoms_copy = {obj_A', obj_B', obj_C', ...}  (NEW copied objects)
+    # - obj_A and obj_A' are DIFFERENT objects at DIFFERENT memory addresses
+    # - obj_A and obj_A' have the SAME data (same coordinates, same element, etc.)
+    # - Removing obj_A' from neighbor_atoms_copy does NOT affect all_neighbors
+    #
+    # Why set instead of list?
+    # - O(1) removal with set.remove() vs O(n) with list.remove()
+    # - No duplicates guaranteed
+    # - Order doesn't matter (symmetry operations find all equivalents)
+    neighbor_atoms_copy = set(deepcopy(all_neighbors[center_atom_idx]))
+    # Store all equivalence classes (list of lists of tuples)
+    equivalence_classes = []
+    # Class ID counter (increments for each new equivalence class found)
+    class_id = 0
+    # ==============================================================================
+    # Main loop: Partition neighbors into equivalence classes
+    # ==============================================================================
+    # Continue until all neighbors are classified into equivalence classes
+    # Each iteration creates one equivalence class and removes its members from neighbor_atoms_copy
+    while len(neighbor_atoms_copy) != 0:
+        # ==============================================================================
+        # STEP 1: Select seed atom for this equivalence class
+        # ==============================================================================
+        # Pop one seed atom from neighbor_atoms_copy
+        # This will be the representative atom for this equivalence class
+        #
+        # CRITICAL: set.pop() returns a REFERENCE, not a copy
+        # ------------------------------------------------
+        # - set.pop() removes and returns a reference to an arbitrary element
+        # - Order is implementation-dependent (hash table internals, not guaranteed)
+        # - Returns a REFERENCE to one of the deep-copied atomIndex objects
+        # - The atomIndex object is removed from the set but still exists in memory
+        # - seed_atom now holds a reference to that object
+        #
+        # Example:
+        # -------
+        # Before: neighbor_atoms_copy = {obj_A', obj_B', obj_C'}
+        # After:  seed_atom = obj_A' (reference to the copied object)
+        #         neighbor_atoms_copy = {obj_B', obj_C'}
+        #
+        # Remember: obj_A' is a COPY (independent of the original obj_A in all_neighbors)
+        #
+        # The specific choice doesn't matter - symmetry operations will find all equivalent neighbors
+        seed_atom = neighbor_atoms_copy.pop()
+        # Pre-compute the distance from center to seed (used for all operations)
+        # This distance must be preserved by symmetry operations (isometry)
+        center_seed_distance = np.linalg.norm(center_atom.cart_coord - seed_atom.cart_coord, ord=2)
+        # ==============================================================================
+        # Initialize the current equivalence class
+        # ==============================================================================
+        # List of tuples: (neighbor_atom_reference, operation_idx, n_vec)
+        current_equivalence_class = []
+        # FIX: Add the seed atom itself to the equivalence class!
+        # It corresponds to the identity operation and zero lattice shift.
+        current_equivalence_class.append((seed_atom, identity_idx, np.array([0, 0, 0])))
+        # ==============================================================================
+        # STEP 2: Find all symmetry-equivalent neighbors
+        # ==============================================================================
+        # Iterate through all space group operations to find atoms equivalent to seed
+        # Skip the identity operation since we already added the seed atom
+        for operation_idx in range(len(magnetic_space_group_cart_spatial)):
+            # Skip identity operation (already handled)
+            if operation_idx == identity_idx:
+                continue
+            # Apply the space group operation to the seed atom
+            # This generates a transformed position that may correspond to another neighbor
+            # Returns (transformed_coord, n_vec) if valid, None otherwise
+            result = get_next_for_center(
+                center_atom=center_atom,
+                seed_atom=seed_atom,
+                center_seed_distance=center_seed_distance,
+                magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+                operation_idx=operation_idx,
+                parsed_config=parsed_config,
+                tolerance=tolerance
+            )
+            # ==============================================================================
+            # Process valid transformation results
+            # ==============================================================================
+            # If transformation is valid (center invariant, distance preserved)
+            if result[0]  is not None:
+                # Unpack the transformed coordinate and lattice shift vector
+                # transformed_coord: 3D Cartesian position after applying symmetry operation
+                # n_vec: Lattice translation [n₀, n₁, n₂] needed to preserve center invariance
+                transformed_coord, n_vec = result
+                # ==============================================================================
+                # Search for matching neighbor in the remaining unclassified set
+                # ==============================================================================
+                # Search for this transformed position among the remaining neighbors
+                # CRITICAL: matched_neighbor is a REFERENCE, not a copy
+                # ---------------------------------------------------
+                # search_one_equivalent_atom() returns:
+                # - A REFERENCE to an atomIndex object in neighbor_atoms_copy if match found
+                # - None if no match found
+                #
+                # This reference is ESSENTIAL for set.remove() to work:
+                # - Python's set.remove() uses object identity (memory address)
+                # - We need the EXACT SAME object reference that's in the set
+                # - A copy wouldn't work (different object, different identity)
+                #
+                # Remember: matched_neighbor references a COPIED atomIndex object (obj_X')
+                # NOT an original from all_neighbors (obj_X)
+                matched_neighbor = search_one_equivalent_atom(
+                    seed_atom,
+                    target_cart_coord=transformed_coord,
+                    neighbor_atoms_copy=neighbor_atoms_copy,
+                    tolerance=tolerance
+                )
+                # ==============================================================================
+                # Add matched neighbor to equivalence class
+                # ==============================================================================
+                # If we found a matching neighbor in the remaining set
+                if matched_neighbor is not None:
+                    # Add to current equivalence class
+                    # Store tuple: (reference to matched_neighbor, operation_idx, copy of n_vec)
+                    # - matched_neighbor: REFERENCE to a deep-copied atomIndex object (from neighbor_atoms_copy)
+                    # - operation_idx: Which space group operation maps seed → matched_neighbor
+                    # - deepcopy(n_vec): Copy of lattice translation vector (n_vec is numpy array, mutable)
+                    current_equivalence_class.append((matched_neighbor, operation_idx, deepcopy(n_vec)))
+                    # Remove from the working set (it's now classified)
+                    # CRITICAL: This only works because matched_neighbor is a REFERENCE
+                    # ----------------------------------------------------------------
+                    # set.remove() searches for object by identity (memory address)
+                    # - matched_neighbor points to the exact same object in neighbor_atoms_copy
+                    # - Python finds the object by comparing memory addresses (fast, O(1))
+                    # - If matched_neighbor were a copy, remove() would raise KeyError
+                    #
+                    # After removal:
+                    # - The atomIndex object still exists in memory (referenced by matched_neighbor
+                    #   and by the tuple in current_equivalence_class)
+                    # - It's just no longer in the neighbor_atoms_copy set
+                    # - The original object in all_neighbors is completely unaffected
+                    neighbor_atoms_copy.remove(matched_neighbor)
+        # ==============================================================================
+        # Complete this equivalence class
+        # ==============================================================================
+        # Add the completed equivalence class to the list
+        # equivalence_classes is a list of lists of tuples
+        # Each tuple contains: (reference to deep-copied atomIndex, operation_idx, n_vec)
+        equivalence_classes.append(current_equivalence_class)
+        # Increment class ID for next equivalence class
+        class_id += 1
+
+    # ==============================================================================
+    # Return results
+    # ==============================================================================
+    return equivalence_classes
+
+def equivalent_class_to_hoppings(one_equivalent_class, center_atom,
+                                 magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec, identity_idx):
+    """
+    Convert an equivalence class of neighbor atoms into hopping objects.
+    Each neighbor atom in the equivalence class is saved into a hopping object.
+    The hopping contains all symmetry information (operation index, rotation, translation, lattice shift).
+
+    This function transforms the raw equivalence class data (tuples of neighbor atoms,
+    operations, and lattice shifts) into structured hopping objects that encapsulate
+    all information needed for one class of equivalent hoppings (center ← neighbor) and symmetry constraints.
+
+    Args:
+        one_equivalent_class: List of tuples (neighbor_atom, operation_idx, n_vec)
+                              where:
+                                - neighbor_atom: atomIndex object for the neighbor
+                                - operation_idx: Index of space group operation that maps
+                                              seed atom to this neighbor
+                                - n_vec: Array [n₀, n₁, n₂] of lattice translation coefficients
+        center_atom: atomIndex object for the center atom (hopping destination)
+                    All hoppings in this equivalence class have the same center atom
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian coordinates
+                                using cif origin (shape: num_ops × 3 × 4)
+                                Used to extract rotation R and translation t for each operation
+        spinor_mat_representation: spinor part matrices
+        delta_vec: indicating time reversal, values are ±1
+        identity_idx: Index of the identity operation in magnetic_space_group_cart_spatial
+                     Used to identify which hopping is the seed (root of constraint tree)
+
+    Returns:
+        List of hopping objects (deep copied for complete independence).
+        Each hopping represents: center ← neighbor
+        The list contains:
+            - One seed hopping (with operation_idx == identity_idx, is_seed=True)
+            - Multiple derived hoppings (with other operation indices, is_seed=False)
+        All hoppings in the list have the same distance (up to numerical precision)
+    Deep Copy Strategy:
+        This function returns a DEEP COPY of the entire hopping list to ensure
+        complete independence between the returned data and any internal state.
+        Two-level protection:
+            1. Each hopping object is deep copied before adding to the list
+            2. The entire list is deep copied before returning
+        This guarantees:
+            - No shared references to the list container
+            - No shared references to hopping objects
+            - No shared references to atom objects or numpy arrays
+            - Caller has complete ownership and can modify freely
+
+
+    """
+    # Initialize hopping list
+    hoppings = []
+    # Convert each equivalence class member to a hopping object
+    for neighbor_atom, operation_idx, n_vec in one_equivalent_class:
+        # Extract rotation matrix R and translation vector t for this operation
+        # The magnetic space group spatial part operation [R|t] transforms the seed neighbor to this neighbor
+        # R, t = get_rotation_translation(magnetic_space_group_cart_spatial, operation_idx)
+        # spinor_mat=spinor_mat_representation[operation_idx]
+        # delta=delta_vec[operation_idx]
+        # Determine if this is the seed hopping (generated by identity operation)
+        # The seed hopping serves as the root of the constraint tree
+        is_seed = (operation_idx == identity_idx)
+        # Create hopping object: center ← neighbor
+        # This represents the tight-binding hopping from neighbor to center atom
+        hop = hopping(
+            to_atom=deepcopy(center_atom),  # Destination: center atom (deep copied)
+            from_atom=deepcopy(neighbor_atom),  # Source: neighbor atom (deep copied),
+            operation_idx=operation_idx,  # Space group operation index (immutable int),
+            # rotation_matrix=deepcopy(R),  # 3×3 rotation matrix from cif (deep copied)
+            # translation_vector=deepcopy(t),  # 3D translation vector from cif (deep copied)
+            n_vec=deepcopy(n_vec),  # Additional lattice shift [n₀, n₁, n₂] (deep copied)
+            # spinor_mat=spinor_mat,
+            # delta=delta,
+            is_seed=is_seed
+        )
+        # Compute the Euclidean distance from neighbor to center
+        # All hoppings in this equivalence class should have the same distance
+        hop.compute_distance()
+        # Add this hopping to the list
+        # Deep copy hopping before adding to list (first level of protection)
+        hoppings.append(deepcopy(hop))
+
+    # Deep copy entire list before returning (second level of protection)
+    # This ensures complete independence: both list structure and contents are copied
+    return deepcopy(hoppings)
+
+
+def hopping_to_vertex(hopping,identity_idx,type_linear):
+    """
+    Convert a hopping object to a vertex object., for equivalent class step
+    Args:
+        hopping:  hopping object to convert
+        identity_idx:  Index of the identity operation
+        type_linear:  string "linear"
+
+    Returns:
+        vertex object (deep copied for independence)
+
+
+    """
+    # Determine constraint type based on whether this is a seed hopping
+    if hopping.is_seed == True:
+        constraint_type = None  # Root vertex has no parent constraint
+    else:
+        constraint_type = type_linear  # Derived from symmetry operation
+    # Create vertex with no parent (parent will be set when building tree)
+    new_vertex = vertex(hopping,
+                        constraint_type,
+                        identity_idx,
+                        parent=None)
+
+    return deepcopy(new_vertex)
+
+def one_equivalent_hopping_class_to_root(one_equivalent_hopping_class, identity_idx, type_linear):
+    """
+    Convert an equivalent hopping class into a constraint tree.
+
+    This function:
+    1. Converts all hoppings to vertex objects
+    2. Finds the root vertex (seed hopping with identity operation)
+    3. Connects all derived vertices as linear children of the root
+    4. Returns the root vertex (which contains references to all children)
+
+    Tree Structure Created:
+    ----------------------
+                    Root (seed, identity operation)
+                     |
+         +-----------+-----------+-----------+
+         |           |           |           |
+      Child 0     Child 1     Child 2     Child 3
+     (linear)    (linear)    (linear)    (linear)
+
+    Each child is derived from root by a symmetry operation.
+    Args:
+        one_equivalent_hopping_class: List of hopping objects (all symmetry-equivalent)
+        identity_idx: Index of the identity operation
+        type_linear: String identifier for linear constraint type (string "linear")
+
+    Returns:
+        vertex object: Root of the constraint tree (contains references to all children)
+    Raises:
+        ValueError: If no root vertex found (no seed hopping in the class)
+    """
+    # ==============================================================================
+    # STEP 1: Convert all hoppings to vertices
+    # ==============================================================================
+    vertex_list = [hopping_to_vertex(one_hopping, identity_idx, type_linear) for one_hopping in
+                   one_equivalent_hopping_class]
+    # ==============================================================================
+    # STEP 2: Find the root vertex (seed hopping)
+    # ==============================================================================
+    tree_root = None
+    derived_vertices = []  # List to store non-root vertices
+    for one_vertex in vertex_list:
+        if one_vertex.is_root == True:
+            if tree_root is not None:
+                # Multiple roots found - this shouldn't happen
+                raise ValueError("Multiple root vertices found in equivalence class! "
+                                 "Each class should have exactly one seed hopping.")
+            tree_root = one_vertex
+        else:
+            derived_vertices.append(one_vertex)
+
+    # ==============================================================================
+    # STEP 3: Validate that root was found
+    # ==============================================================================
+    if tree_root is None:
+        raise ValueError("No root vertex found in equivalence class! "
+                         f"Identity operation (idx={identity_idx}) not present.")
+    # ==============================================================================
+    # STEP 4: Connect all derived vertices as children of root
+    # ==============================================================================
+    # CRITICAL: Use add_child() to establish bidirectional parent-child relationships
+    # This creates REFERENCES (not copies) between root and children
+    for i, child_vertex in enumerate(derived_vertices):
+        tree_root.add_child(child_vertex)
+
+    # ==============================================================================
+    # STEP 5: Return the root vertex
+    # ==============================================================================
+    # IMPORTANT: Return tree_root WITHOUT deep copying
+    # ------------------------------------------------
+    # The tree_root contains REFERENCES to its children via tree_root.children
+    # Deep copying would break these parent-child references
+    # Caller receives the actual root vertex object with intact tree structure
+    return tree_root
+
+
+def atom_equal(atom1, atom2,tolerence=1e-3):
+    """
+    check if two atoms occupy the same position
+    Args:
+        atom1:
+        atom2:
+
+    Returns:
+
+    """
+    dist_diff=np.linalg.norm(atom1.cart_coord-atom2.cart_coord,ord=2)
+    if dist_diff<tolerence and atom1.position_name==atom2.position_name:
+        return True
+    else:
+        return False
+
+
+def apply_full_transformation_and_check_position(atom1,atom2,R,t,lattice_basis,n_vec,tolerance=1e-3):
+    #checks if full transformation applied to atoms1 goes to atom2
+    atom1_pos=atom1.cart_coord
+    atom2_pos=atom2.cart_coord
+
+    atom1_transformed_pos=cif_plus_translation(R,t,lattice_basis,n_vec,atom1_pos)
+    diff=np.linalg.norm(atom1_transformed_pos-atom2_pos,ord=2)
+    if diff<tolerance:
+        return True
+    else:
+        return False
+
+
+def check_hopping_linear(hopping1,hopping2, magnetic_space_group_cart_spatial,
+                         lattice_basis, tolerance=1e-3):
+    """
+    Check if hopping2 is related to hopping1 by a space group symmetry operation.
+     For tight-binding models, a linear symmetry constraint implies:
+        (i) for delta=1, no time reversal,
+            T(hopping2) = [V1(g)⊗U(g)] @ T(hopping1) @ [V2(g)†⊗U(g)†]
+        (ii) for delta=-1, there is time reversal
+            T(hopping2) = [V1(g)⊗~U(g)] @ T*(hopping1) @ [V2(g)†⊗~U(g)†]
+    Geometrically, this function checks if the displacement vector of hopping2
+    is the result of applying a magnetic space group spatial part operation plus a lattice shift to
+    the displacement vector of hopping1.
+
+    Mathematical Condition:
+    ----------------------
+    Given hopping1 vector: r1 = center1 - neighbor1
+    Given hopping2 vector: r2 = center2 - neighbor2
+
+    hopping2 is linearly related to hopping1 if there exists a space group
+    operation g = (R|t) and lattice shift n_vec = [n0, n1, n2] such that:
+        R @ r1 + t + n_vec·[a0,a1,a2] = r2
+    EDGE CASE (Self-Hopping / On-Site):
+    -----------------------------------
+    If dist1 = dist2 = 0 (hopping is from an atom to itself), the hopping vector is 0.
+    The condition simplifies to checking if the operation maps atom1 to atom2:
+        R @ pos_atom1 + t + n_vec·basis = pos_atom2
+
+    Args:
+        hopping1: First hopping object (reference hopping)
+        hopping2: Second hopping object (candidate symmetry equivalent)
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian coordinates
+                                           using cif origin (shape: num_ops × 3 × 4)
+
+        lattice_basis: Primitive lattice basis vectors (3×3 array), each row is a basis vector
+        tolerance: Numerical tolerance for comparison (default: 1e-3)
+
+    Returns:
+        tuple: (is_linear, operation_idx, n_vec, delta)
+        - is_linear (bool): True if hopping2 is related to hopping1 via symmetry
+        - operation_idx (int or None): Index of the magnetic space group operation
+        - n_vec (ndarray or None): Lattice translation vector [n0, n1, n2]
+
+    """
+    # ==============================================================================
+    # STEP 1: Extract atoms and validate types
+    # ==============================================================================
+    # hopping1: to_atom1 (center) ← from_atom1 (neighbor)
+    to_atom1 = hopping1.to_atom
+    from_atom1 = hopping1.from_atom
+
+    # hopping2: to_atom2 (center) ← from_atom2 (neighbor)
+    to_atom2 = hopping2.to_atom
+    from_atom2 = hopping2.from_atom
+
+    to_atom1_position_name = to_atom1.position_name
+    from_atom1_position_name = from_atom1.position_name
+
+    to_atom2_position_name = to_atom2.position_name
+    from_atom2_position_name = from_atom2.position_name
+
+    dist1 = hopping1.distance
+    dist2 = hopping2.distance
+
+    # Check 1: Hopping distances must be identical (isometry)
+    if np.abs(dist1 - dist2) > tolerance:
+        return False, None, None
+    # Check 2: Atom wyckoff position must match for a valid symmetry operation
+    if to_atom1_position_name != to_atom2_position_name or from_atom1_position_name != from_atom2_position_name:
+        return False, None, None
+
+    # ==============================================================================
+    # STEP 2: Handle Edge Case (Self-Hopping / On-Site Terms)
+    # ==============================================================================
+    is_self_hopping = (dist1 < tolerance)
+    if is_self_hopping:
+        # For self-hopping, center and neighbor are the same atom
+        # We need to check if the operation maps atom1 to atom2.
+        # Equation: R @ pos_atom1 + t + n_vec·basis = pos_atom2
+        pos_atom1 = to_atom1.cart_coord
+        pos_atom2 = to_atom2.cart_coord
+        for op_idx in range(len(magnetic_space_group_cart_spatial)):
+            R, t = get_rotation_translation(magnetic_space_group_cart_spatial, op_idx)
+            # Apply operation to atom1 position
+            transformed_pos = R @ pos_atom1 + t
+            # Calculate required shift to reach atom2
+            required_lattice_shift = pos_atom2 - transformed_pos
+            is_lattice, n_vec =is_lattice_vector(
+                required_lattice_shift,
+                lattice_basis,
+                tolerance
+            )
+            if is_lattice:
+                return True, op_idx, n_vec.astype(int)
+        # If loop finishes for self-hopping without match
+        return False, None, None
+
+    # ==============================================================================
+    # STEP 3: Standard Case (Inter-atomic Hopping)
+    # ==============================================================================
+    # Displacement vector for hopping1
+    # print("entering here")
+    for op_idx in range(len(magnetic_space_group_cart_spatial)):
+        # Extract rotation R and translation t from space group operation
+        R, t = get_rotation_translation(magnetic_space_group_cart_spatial, op_idx)
+        # Apply rotation and translation to to_atom1.cart_coord\
+        # transformed = R @ r1 + t
+        transformed_to_atom1_pos = R @ to_atom1.cart_coord + t
+        # Calculate required lattice shift
+        # We need: transformed_vec + n_vec·basis = hopping_vec2
+        # Therefore: n_vec·basis = hopping_vec2 - transformed_vec
+        required_lattice_shift = to_atom2.cart_coord - transformed_to_atom1_pos
+        # Check if required_lattice_shift is a lattice vector
+        is_lattice, n_vec = is_lattice_vector(
+            required_lattice_shift,
+            lattice_basis,
+            tolerance
+        )
+        if is_lattice:
+            # check if this operation maps from_atom1 to from_atom2
+            from_atoms_match = apply_full_transformation_and_check_position(from_atom1, from_atom2, R, t, lattice_basis,
+                                                                            n_vec,
+                                                                            tolerance)
+            if from_atoms_match:
+                return True, op_idx, n_vec.astype(int)
+            else:
+                continue
+
+    # ==============================================================================
+    # No linear relationship found
+    # ==============================================================================
+    return False, None, None
+
+
+
+def check_hopping_hermitian(hopping1,hopping2, magnetic_space_group_cart_spatial,
+                            lattice_basis, tolerance=1e-3):
+    """
+     Check if hopping2 is the Hermitian conjugate of hopping1.
+    For tight-binding models, Hermiticity requires:
+        H† = H  =>  T(i ← j) = T(j ← i)†
+
+    This function checks if hopping2 corresponds to the reverse direction of hopping1
+    under some magnetic space group spatial part operation with lattice translation.
+
+
+    Mathematical Condition:
+    ----------------------
+    Given hopping1: center1 ← neighbor1
+    And hopping2: center2 ← neighbor2
+    hopping2 is Hermitian conjugate of hopping1 if there exists a magnetic space group
+    spatial part  operation g = (R|t) and lattice shift n_vec = [n0, n1, n2] such that:
+    1. The conjugate of hopping2 (neighbor2 ← center2) equals the transformed hopping1
+    2. Specifically: R @ (center1 - neighbor1) + t + n_vec·[a0,a1,a2] = neighbor2 - center2
+
+    This means the hopping vector transforms consistently under the symmetry operation.
+
+    Args:
+        hopping1: First hopping object (reference hopping)
+        hopping2: Second hopping object (candidate Hermitian conjugate)
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian coordinates
+                                           using cif origin (shape: num_ops × 3 × 4)
+
+        lattice_basis: Primitive lattice basis vectors (3×3 array, each row is a basis vector)
+                      expressed in Cartesian coordinates using cif origin
+        tolerance: Numerical tolerance for comparison (default: 1e-3)
+
+    Returns:
+        tuple: (is_hermitian, operation_idx, n_vec, delta)
+        - is_hermitian (bool): True if hopping2 is Hermitian conjugate of hopping1
+        - operation_idx (int or None): Index of the space group operation that
+                                        relates hopping1 to hopping2, or None if not Hermitian conjugate
+        - n_vec (ndarray or None): Lattice translation vector [n0, n1, n2],
+                                   or None if not Hermitian conjugate
+
+    Example:
+        For hBN with hopping1: N[0,0,0] ← B[0,0,0]
+        and hopping2: B[0,0,0] ← N[0,0,0]
+        These are Hermitian conjugates under identity operation with zero lattice shift.
+    """
+    # ==============================================================================
+    # STEP 1: Get atoms from both hoppings
+    # ==============================================================================
+    # hopping1: to_atom1 (center) ← from_atom1 (neighbor)
+    to_atom1 = hopping1.to_atom
+    from_atom1 = hopping1.from_atom
+    # hopping2: to_atom2 (center) ← from_atom2 (neighbor)
+    # For Hermiticity, we need the CONJUGATE (reverse direction)
+    # conjugate of hopping2: to_atom2c (becomes center) ← from_atom2c (becomes neighbor)
+    to_atom2c, from_atom2c = hopping2.conjugate()
+
+    to_atom1_position_name = to_atom1.position_name
+    from_atom1_position_name = from_atom1.position_name
+
+    to_atom2c_position_name = to_atom2c.position_name
+    from_atom2c_position_name = from_atom2c.position_name
+
+    dist1 = hopping1.distance
+    dist2 = hopping2.distance
+    if np.abs(dist1 - dist2) > tolerance:
+        return False, None, None
+    if to_atom1_position_name != to_atom2c_position_name or from_atom1_position_name != from_atom2c_position_name:
+        return False, None, None
+
+    # ==============================================================================
+    # STEP 2: Handle Edge Case (Self-Hopping / On-Site Terms)
+    # ==============================================================================
+    is_self_hopping = (dist1 < tolerance)
+    if is_self_hopping:
+        # # For self-hopping, center and neighbor are the same atom
+        ## We need to check if the operation maps atom1 to atom2
+        # Equation: R @ pos_atom1 + t + n_vec·basis = pos_atom2
+        pos_atom1 = to_atom1.cart_coord
+        pos_atom2c = to_atom2c.cart_coord
+        for op_idx in range(len(magnetic_space_group_cart_spatial)):
+            R, t = get_rotation_translation(magnetic_space_group_cart_spatial, op_idx)
+            # Apply operation to atom1 position
+            transformed_pos = R @ pos_atom1 + t
+            # Calculate required shift to reach atom2
+            required_lattice_shift = pos_atom2c - transformed_pos
+            is_lattice, n_vec = is_lattice_vector(
+                required_lattice_shift,
+                lattice_basis,
+                tolerance
+            )
+            if is_lattice:
+                return True, op_idx, n_vec.astype(int)
+
+        return False, None, None
+    # ==============================================================================
+    # STEP 3: Standard Case (Inter-atomic Hopping)
+    # ==============================================================================
+    # Displacement vector for hopping1
+    for op_idx in range(len(magnetic_space_group_cart_spatial)):
+        # Extract rotation R and translation t from space group operation
+        R, t = get_rotation_translation(magnetic_space_group_cart_spatial, op_idx)
+        # Apply rotation and translation to to_atom1.cart_coord
+        # transformed = R @ r1 + t
+        transformed_to_atom1_pos = R @ to_atom1.cart_coord + t
+        # Calculate required lattice shift
+        # match to_atom1 with to_atom2c
+        required_lattice_shift = to_atom2c.cart_coord - transformed_to_atom1_pos
+        # Check if required_lattice_shift is a lattice vector
+        is_lattice, n_vec = is_lattice_vector(
+            required_lattice_shift,
+            lattice_basis,
+            tolerance
+        )
+        if is_lattice:
+            # check if this operation maps  from_atom1 to from_atom2c
+            from_atoms_match = apply_full_transformation_and_check_position(from_atom1, from_atom2c, R, t,
+                                                                            lattice_basis,
+                                                                            n_vec,
+                                                                            tolerance)
+            if  from_atoms_match:
+                return True, op_idx, n_vec.astype(int)
+            else:
+                continue
+    # ==============================================================================
+    # No linear relationship found
+    # ==============================================================================
+    return False, None, None
+
+
+def add_to_root_linear(root1, root2, magnetic_space_group_cart_spatial,
+                       lattice_basis, type_linear, tolerance=1e-3):
+    """
+    Attempt to graft root2 onto root1 as a linear child if a symmetry relationship exists.
+    This function checks if root2's hopping can be generated from root1's hopping
+    by applying a magnetic space group spatial part operation (rotation + translation + lattice shift).
+    If a valid linear relationship is found, root2 is attached to root1 in the
+    constraint tree.
+
+    Physical Meaning:
+    ----------------
+    If successful, the hopping matrix T2 (of root2) is constrained by T1 (of root1):
+    (i) for delta=1, T2 = [V1(g)⊗U(g)] @ T1 @ [V2(g)† ⊗ U(g)†]
+    (ii) for delta=-1, T2=[V1(g)⊗~U(g)] @ T1* @ [V2(g)†⊗~U(g)†]
+
+    Args:
+        root1: First root vertex (parent candidate).
+        root2: Second root vertex (child candidate).
+        magnetic_space_group_cart_spatial:
+
+        lattice_basis: 3x3 array of lattice basis vectors (each row is a basis vector)
+        type_linear: String identifier for linear constraint type, value: "linear".
+        tolerance: Numerical tolerance for comparison (default: 1e-3).
+
+    Returns:
+        bool: True if root2 was successfully grafted as a linear child of root1.
+              False otherwise.
+    Side Effects:
+    -------------
+    If returns True:
+    - root1.children gains root2
+    - root2.parent becomes root1
+    - root2.is_root becomes False
+    - root2.type becomes type_linear
+    - root2.hopping.operation_idx and n_vec are updated to reflect the symmetry transform.
+    """
+    hopping1 = root1.hopping
+    hopping2 = root2.hopping
+    # check if hopping2 can be obtained linearly from hopping1
+    # This verifies: R @ r1 + t + n_vec·basis = r2
+    is_linear, op_idx, n_vec = check_hopping_linear(
+        hopping1, hopping2,
+        magnetic_space_group_cart_spatial,
+        lattice_basis, tolerance
+    )
+    if is_linear == True:
+        # ======================================================================
+        #Perform Grafting
+        # ======================================================================
+        # 1. Add root2 as root1's child (updates root1.children and root2.parent)
+        root1.add_child(root2)
+        # 2. Update root2 properties to reflect its dependent status
+        root2.type = type_linear
+        root2.is_root = False
+        # root2.parent is already set by add_child,
+        # 3. Store the symmetry parameters required to generate T2 from T1
+        root2.hopping.operation_idx = op_idx
+        root2.hopping.n_vec = deepcopy(n_vec)
+        return True
+    else:
+        return False
+
+
+def add_to_root_hermitian(root1, root2, magnetic_space_group_cart_spatial,
+                          lattice_basis, type_hermitian, tolerance=1e-3):
+    """
+    If root2's hopping is hermitian conjugate of root1's hopping,
+    add root2 as root1's child with hermitian constraint. This function checks if root2 is the Hermitian conjugate of root1 under
+    some magnetic space group spatial part operation. If so, it adds root2 as a child of root1 with
+    the specified hermitian type and updates root2's properties accordingly.
+    Args:
+        root1:  First root vertex (parent)
+        root2:  Second root vertex (candidate hermitian conjugate)
+        magnetic_space_group_cart_spatial:  List of magnetic space group spatial part matrices in Cartesian coordinates
+        lattice_basis: Primitive lattice basis vectors (3×3 array)
+        type_hermitian:  String identifier for hermitian constraint type (e.g., "hermitian")
+        tolerance: Numerical tolerance for comparison (default: 1e-3)
+
+    Returns:
+        bool: True if root2 was added as hermitian child of root1, False otherwise
+
+    Example:
+        For hBN:
+        root1: N[0,0,0] ← B[0,0,0]
+        root2: B[0,0,0] ← N[0,0,0]
+        add_to_root_hermitian(root1, root2, ..., "hermitian") will add root2
+        as hermitian child of root1 with type="hermitian"
+    """
+    hopping1 = root1.hopping
+    hopping2 = root2.hopping
+    # Check if hopping2 is hermitian conjugate of hopping1
+    is_hermitian, op_idx, n_vec = check_hopping_hermitian(
+        hopping1, hopping2, magnetic_space_group_cart_spatial,
+        lattice_basis, tolerance)
+    if is_hermitian == True:
+        # Add root2 as root1's child
+        root1.add_child(root2)
+        # Set root2 properties for hermitian conjugate relationship
+        root2.type = type_hermitian
+        root2.is_root = False
+        root2.hopping.operation_idx = op_idx
+        root2.hopping.n_vec = deepcopy(n_vec)
+        return True
+    else:
+        return False
+
+def convert_equivalence_classes_to_hoppings(equivalence_classes, center_atom,
+                                            magnetic_space_group_cart_spatial,
+                                            spinor_mat_representation,delta_vec, identity_idx):
+    """
+    Convert all equivalence classes of neighbors into hopping objects.
+    Each equivalence class contains symmetry-equivalent neighbors at the same distance.
+    This function:
+    1. Sorts equivalence classes by distance (nearest neighbors first)
+    2. Converts each equivalence class into an equivalent hopping class
+
+    An equivalent hopping class contains all hoppings (center ← neighbor) that are
+    related by symmetry operations. All hoppings in one class have:
+    - Same hopping distance
+    - Same center and neighbor atom types
+    - Hopping matrices related by symmetry transformations
+
+    IMPORTANT: Returns deep copy for complete independence.
+    The hopping objects themselves don't contain tree structure - that comes later
+    when vertices are created with parent-child references.
+
+    Args:
+        equivalence_classes: List of equivalence classes (unsorted)
+                            Each class is a list of tuples:
+                            (neighbor_atom, operation_idx, n_vec)
+        center_atom: atomIndex object for the center atom (hopping destination)
+        magnetic_space_group_cart_spatial:  List of magnetic space group spatial part matrices in Cartesian coordinates
+                                using cif origin (shape: num_ops × 3 × 4)
+        spinor_mat_representation: spinor part matrices
+        delta_vec: indicating time reversal, values are ±1
+        identity_idx: Index of the identity operation
+
+    Returns:
+        Deep copy of list of equivalent hopping classes (sorted by distance):
+        - Outer list: one equivalent hopping class per equivalence class
+        - Inner list: all equivalent hoppings in that class
+
+         Structure:
+         [
+            [hop_seed, hop_derived0, hop_derived1, ...],  # Class 0 (nearest, usually self)
+            [hop_seed, hop_derived0, ...],                # Class 1 (next-nearest)
+            ...
+        ]
+        Each hopping class contains:
+        - One seed hopping (is_seed=True, operation_idx=identity_idx)
+        - Multiple derived hoppings (is_seed=False, related by symmetry)
+
+        Deep Copy Strategy:
+        ------------------
+        Returns deepcopy(all_hopping_classes) for complete independence.
+
+         HOPPING vs VERTEX separation:
+         - hopping objects: Store physical data (atoms, distance, operation_idx, etc.)
+                          Can be freely copied - no tree structure inside
+         - vertex objects: Store tree relationships (parent, children, is_root)
+                         These will be created LATER and should NOT be deep copied
+                         once the tree is built (would break parent-child references)
+
+    """
+    # ==============================================================================
+    # STEP 1: Sort equivalence classes by distance
+    # ==============================================================================
+    # Sort by distance to center atom (nearest neighbors first)
+    # Each equivalence class eq_class is a list of tuples: (neighbor_atom, operation_idx, n_vec)
+    # We extract the first neighbor from each class to compute its distance
+    equivalence_classes_sorted = sorted(
+        equivalence_classes,
+        key=lambda eq_class: np.linalg.norm(
+            eq_class[0][0].cart_coord - center_atom.cart_coord, ord=2
+        )
+    )
+    # eq_class[0][0] breakdown:
+    # eq_class[0] = first tuple in the equivalence class: (neighbor_atom, operation_idx, n_vec)
+    # eq_class[0][0] = neighbor_atom (first element of that tuple)
+    # All members in an equivalence class have the same distance, so we use the first one
+
+    # ==============================================================================
+    # STEP 2: Convert each equivalence class to equivalent hopping class
+    # ==============================================================================
+    all_hopping_classes = []
+    for class_id, eq_class in enumerate(equivalence_classes_sorted):
+        # Convert this equivalence class to equivalent hopping class
+        equivalent_hoppings =equivalent_class_to_hoppings(
+            one_equivalent_class=eq_class,
+            center_atom=center_atom,
+            magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+            spinor_mat_representation=spinor_mat_representation,
+            delta_vec=delta_vec,
+            identity_idx=identity_idx
+
+        )
+        all_hopping_classes.append(equivalent_hoppings)
+
+    # ==============================================================================
+    # Return deep copy for complete independence
+    # ==============================================================================
+    # Safe to deep copy hopping objects:
+    # - hopping class stores only physical data (atoms, distances, operations)
+    # - No tree structure is embedded in hopping objects
+    # - Tree structure lives in vertex objects (created later)
+    # - Vertices wrap hoppings and add parent/children/is_root attributes
+    return deepcopy(all_hopping_classes)
+
+
+def construct_all_roots_for_1_atom(equivalent_hoppings_all_for_1_atom,identity_idx,type_linear):
+    """
+    Construct constraint tree roots for all hopping classes of one center atom.
+    This function processes all equivalent hopping classes for a single center atom
+    and builds a constraint tree for each class. Each tree has:
+    - Root vertex: seed hopping (identity operation)
+    - Children vertices: derived hoppings (symmetry operations)
+    Args:
+        equivalent_hoppings_all_for_1_atom:  List of hopping classes for one center atom
+                                           Each element is a list of equivalent hoppings
+                                           Structure: [[class_0_hoppings], [class_1_hoppings], ...]
+        identity_idx:  Index of the identity operation in space_group_cart
+        type_linear:  String identifier for linear constraint type (string "linear")
+
+
+    Returns:
+        list: List of root vertex objects, one for each hopping class
+        Each root contains references to its children forming a constraint tree
+    CRITICAL: Returns references, not deep copies
+    --------------------------------------------
+    Each root vertex in the returned list contains a tree structure with:
+    - root.children = [child0, child1, ...] (references to child vertices)
+    - Each child has child.parent pointing back to root
+    Do NOT deep copy the returned roots - this would break tree structure!
+
+    """
+    root_list = []
+    for class_idx, eq_class_hoppings in enumerate(equivalent_hoppings_all_for_1_atom):
+        # Build constraint tree for this hopping class
+        root = one_equivalent_hopping_class_to_root(
+            eq_class_hoppings,
+            identity_idx,
+            type_linear
+        )
+        root_list.append(root)
+    return root_list
+
+def generate_all_trees_for_unit_cell(unit_cell_atoms,all_neighbors,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,identity_idx,type_linear,parsed_config,tolerance=1e-3):
+    """
+    Generate all trees for all atoms in the unit cell, based on equivalent neighbors around the center atom
+    This function generates trees, for later tree grafting
+
+    This function is the 1st main step that builds a complete "forest" of symmetry
+    constraint trees for the entire unit cell [0,0,0].  Each tree represents one equivalence class of hoppings with
+    the same center atom (hopping destination). The trees are initially  independent and will later be connected via tree graftings.
+
+
+    Overview:
+    ---------
+    For each atom in the unit cell (center atom, hopping destination):
+    1. Find all neighboring atoms within the cutoff radius
+    2. Partition neighbors into equivalence classes based on symmetry
+    3. Convert each equivalence class into hopping objects (center ← neighbor)
+    4. Build a constraint tree for each equivalence class:
+        - Root: seed hopping (generated by identity operation)
+        - Children: derived hoppings (generated by other symmetry operations)
+    5. Collect all trees into a single forest (a list of trees)
+
+    The resulting forest contains trees built on symmetry around a center atom. After this function returns,
+    there are two grafting procedures that find dependence between tree roots.
+
+    In tight-binding models, the Hamiltonian matrix contains hopping terms T(i ← j)
+    representing electron hopping from orbital j to orbital i. Crystal symmetry
+    dramatically reduces the number of independent hopping parameters via two mechanisms
+    (a) magnetic space group symmetry
+    (b) Hermiticity
+
+    Tree Structure (Before Grafting):
+    ---------------------------------
+    Each constraint tree in the returned forest has this structure:
+        Root Vertex (seed hopping, identity operation, is_root=True)
+         │
+         ├── Child 0 (linear constraint, symmetry operation 1, type="linear")
+         ├── Child 1 (linear constraint, symmetry operation 2, type="linear")
+         ├── Child 2 (linear constraint, symmetry operation 3, type="linear")
+         └── Child 3 (linear constraint, symmetry operation 4, type="linear")
+         └── Child 4 (linear constraint, symmetry operation 5, type="linear")
+
+    The root contains the independent hopping matrix (free parameters, determined by root stabilizers, this will be computed after tree graftings).
+    Each child's matrix is determined by applying a symmetry transformation:
+        (i) for delta=1, no time reversal,
+            T_child = [V1(g)⊗U(g)] @ T_root @ [V2(g)†⊗U(g)†]
+        (ii) for delta=-1, there is time reversal
+             T_child =[V1(g)⊗~U(g)] @ T_root* @ [V2(g)†⊗~U(g)†]
+    where V1(g) is the orbital representations of symmetry operation g, for center atom (destination)
+          V2(g) is the orbital representations of symmetry operation g, for neighbor atom (source)
+          U(g) is the spinor representation for g
+    Args:
+        unit_cell_atoms (list): List of atomIndex objects representing all atoms
+                                in the reference unit cell [0,0,0]. Each atomIndex contains:
+                                - Position (cell indices, fractional/Cartesian coordinates)
+                                - Atom type, Wyckoff position and orbital information
+                                - Pre-computed orbital representation matrices
+        all_neighbors (dict): Dictionary mapping center atom index to its neighbors.
+                                Format: {center_idx: [neighbor1, neighbor2, ...], ...}
+                                Each value is a list of atomIndex objects within cutoff radius.
+        magnetic_space_group_cart_spatial (list of np arrays): Magnetic space group spatial part operations in  Cartesian coordinates using cif origin.
+                                                     Each operation is a 3×4 matrix [R|t] where:
+                                                     - R (3×3): Rotation/reflection matrix
+                                                     - t (3×1): Translation vector
+        identity_idx: Index of the identity operation in magnetic_space_group_cart_spatial.
+                      The identity operation E = [I|0] has:
+                      - R = 3×3 identity matrix
+                      - t = zero vector
+                      Used to identify seed hoppings (roots of constraint trees).
+        type_linear (str): String identifier for linear constraint type.
+                            value: "linear"
+                            Applied to child vertices derived from parent via symmetry operations.
+                            Leads to the constraint:
+                                (i) for delta=1, no time reversal,
+                                    T_child = [V1(g)⊗U(g)] @ T_root @ [V2(g)†⊗U(g)†]
+                                (ii) for delta=-1, there is time reversal
+                                      T_child =[V1(g)⊗~U(g)] @ T_root* @ [V2(g)†⊗~U(g)†]
+                            where V1(g) and V2(g) are orbital representations of operation g, U(g) is spinor
+                            representation of g
+    Returns:
+        list: Forest of  root vertex objects (constraint tree roots).
+        Each element is a vertex object representing the root of one constraint tree.
+        Structure: [root_0, root_1, root_2, ..., ]
+
+        Each root vertex contains:
+        - root.hopping: The seed hopping object (center ← neighbor)
+        - root.children: List of child vertex objects (derived hoppings)
+        - root.parent: None (roots have no parent before grafting)
+        - root.is_root: True (before grafting)
+        - root.type: None (no parent constraint before grafting)
+        The list is sorted for each atom center, but atom centers are not sorted
+
+        IMPORTANT: Returns REFERENCES, not copies. Essential for tree grafting!
+
+        Notes:
+        ------
+        - This function only encodes magnetic space group spatial part symmetry constraints around each center atom
+        - Additional constraints (magnetic space group symmetry, Hermiticity) between roots will be dealt with
+           later via tree graftings
+        - Trees are built using REFERENCES, not deep copies (essential for grafting)
+    """
+    # ==============================================================================
+    # Initialize forest of constraint trees
+    # ==============================================================================
+    roots_all = []
+    # ==============================================================================
+    # Main loop: Process each atom in the unit cell [0,0,0]
+    # ==============================================================================
+    for i, center_atom_i in enumerate(unit_cell_atoms):
+        # ==============================================================================
+        # STEP 1: Partition neighbors into equivalence classes based on symmetry
+        # ==============================================================================
+        equivalence_classes_center_atom_i = get_equivalent_sets_for_one_center_atom(
+            center_atom_idx=i,
+            unit_cell_atoms=unit_cell_atoms,
+            all_neighbors=all_neighbors,
+            magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+            identity_idx=identity_idx,
+            parsed_config=parsed_config,
+            tolerance=tolerance
+        )
+        # ==============================================================================
+        # STEP 2: Convert equivalence classes to hopping objects
+        # ==============================================================================
+        equivalent_classes_hoppings_for_center_atom_i=convert_equivalence_classes_to_hoppings(
+            equivalence_classes=equivalence_classes_center_atom_i,
+            center_atom=center_atom_i,
+            magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+            spinor_mat_representation=spinor_mat_representation,
+            delta_vec=delta_vec,
+            identity_idx=identity_idx
+        )
+        # ==============================================================================
+        # STEP 3: Build constraint trees for each equivalence class
+        # ==============================================================================
+        roots_for_center_atom_i=construct_all_roots_for_1_atom(
+            equivalent_hoppings_all_for_1_atom=equivalent_classes_hoppings_for_center_atom_i,
+            identity_idx=identity_idx,
+            type_linear=type_linear
+        )
+        # ==============================================================================
+        # STEP 4: Add trees from this center atom to the global forest
+        # ==============================================================================
+        roots_all.extend(roots_for_center_atom_i)
+
+    return roots_all
+
+
+def grafting_to_existing_linear(roots_grafted_linear,root_to_be_grafted,magnetic_space_group_cart_spatial,lattice_basis,type_linear,tolerance=1e-3):
+    """
+    Attempt to graft a new tree onto an existing collection of  trees, as linear child
+    This function checks if `root_to_be_grafted` is related by a magnetic space group spatial part symmetry
+    operation to any root already in the `roots_grafted_linear` collection. If a
+    linear relationship is found, the new tree is grafted onto the matching root
+    as a linear child, making it dependent.
+
+    Grafting Strategy:
+    -----------------
+    This function implements an "early exit" strategy:
+    - Iterate through existing linear-grafted roots.
+    - Check each one for a linear symmetry relationship with the new tree.
+    - On the first match, graft and immediately return True.
+    - If no matches are found after checking all, return False.
+
+    Use Case:
+    --------
+    This is called when reducing the number of independent hopping parameters.
+    As each new root is encountered, we check if it is merely a symmetry copy
+     of a root we have already processed.
+
+
+    Args:
+        roots_grafted_linear (list):  List of root vertex objects representing
+                                     roots that have already been processed/accepted.
+                                     IMPORTANT: Modified in-place when grafting occurs
+                                     (tree structures grow, but list itself is unchanged).
+        root_to_be_grafted:  New root vertex attempting to be grafted.
+                                     If grafting succeeds:
+                                     - Becomes a linear child of a root in roots_grafted_linear
+                                     - is_root changes from True to False
+                                     - type changes from None to type_linear
+                                     - Entire subtree moves with it
+                                     If grafting fails:
+                                     - Remains independent (caller usually adds it to the list)
+        magnetic_space_group_cart_spatial  (list):
+        lattice_basis (np.ndarray): Primitive lattice basis vectors.
+        type_linear (str): String identifier for linear constraint type ("linear").
+        tolerance:  Numerical tolerance for comparisons (default: 1e-3).
+
+    Returns:
+        bool: True if root_to_be_grafted was successfully grafted onto one of the
+               existing roots in roots_grafted_linear.
+               False if no linear relationship found with any existing root.
+
+    """
+    # Iterate through each root that has already been accepted as independent
+    for root1 in roots_grafted_linear:
+        # Attempt to graft the new root onto the existing root1\
+        # add_to_root_linear handles the check and the structural update if successful
+        success = add_to_root_linear(
+            root1=root1,
+            root2=root_to_be_grafted,
+            magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+            lattice_basis=lattice_basis,
+            type_linear=type_linear,
+            tolerance=tolerance
+        )
+        if success == True:
+            # Early exit: We found a parent!
+            # The tree is now grafted, so we stop searching.
+            return True
+    # If we finish the loop without returning, no parent was found
+    return False
+
+def tree_grafting_linear(roots_all,magnetic_space_group_cart_spatial,lattice_basis,type_linear,tolerance=1e-3):
+    """
+    Perform Linear tree grafting on all constraint trees.
+    This function implements a symmetry reduction step based on linear constraint. It iterates through
+    all root vertices and attempts to graft each one onto existing trees if a linear symmetry relationship exists.
+
+    Algorithm:
+    ---------
+    1. Deep copy all roots to avoid modifying the input.
+    2. Initialize roots_grafted_linear with the 0th root.
+    3. For each remaining root:
+        a. Try to graft it onto any existing root in roots_grafted_linear using
+           magnetic space group spatial part symmetry (rotation + translation + lattice shift).
+        b. If grafting succeeds: the root becomes a linear child (dependent).
+        c. If grafting fails: add the root to roots_grafted_linear as a new independent root.
+    4. Return the final collection of independent roots.
+
+    Tree Structure After Grafting:
+    -----------------------------
+    Before:
+        Root A (independent)          Root B (independent)
+    After (if B is symmetry equivalent to A):
+        Root A
+        ├── ... (existing children)
+        └── Root B (linear) ← Now a child of A!
+            └── ... (B's subtree moves with it)
+    Physical Meaning:
+    ----------------
+    If root B is grafted as a linear child of root A, it implies that the hopping
+    matrix represented by B is not  free, but is related to A by symmetry:
+    (i) for delta=1, no time reversal,
+            T(B) = [V1(g)⊗U(g)] @ T(A) @ [V2(g)†⊗U(g)†]
+        (ii) for delta=-1, there is time reversal
+            T(B) = [V1(g)⊗~U(g)] @ T(A)* @ [V2(g)†⊗~U(g)†]
+    Args:
+        roots_all (list): List of root vertex objects
+        magnetic_space_group_cart_spatial (list): Magnetic space group spatial part operations in Cartesian coordinates.
+        lattice_basis (np.ndarray): Primitive lattice basis vectors.
+        type_linear (str): String identifier for linear constraint type ("linear").
+        tolerance (float): Numerical tolerance for comparisons (default: 1e-3).
+
+    Returns:
+        list: Collection of root vertex objects after Linear grafting.
+
+    """
+    # ==============================================================================
+    # STEP 1: Initialize working variables
+    # ==============================================================================
+    roots_all_num = len(roots_all)
+    # Deep copy to ensure input list remains unmodified
+    roots_all_copy = deepcopy(roots_all)
+    # Initialize the list of independent roots with the 0th one
+    roots_grafted_linear = [roots_all_copy[0]]
+    # ==============================================================================
+    # STEP 2: Iterate through remaining roots and attempt grafting
+    # ==============================================================================
+    for j in range(1, roots_all_num):
+        root_to_be_grafted = roots_all_copy[j]
+        # Attempt to graft onto existing independent roots
+        was_grafted = grafting_to_existing_linear(
+            roots_grafted_linear=roots_grafted_linear,
+            root_to_be_grafted=root_to_be_grafted,
+            magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+            lattice_basis=lattice_basis,
+            type_linear=type_linear,
+            tolerance=tolerance
+        )
+        if was_grafted == True:
+            pass
+        else:
+            # If no relationship found, this root remains independent
+            roots_grafted_linear.append(root_to_be_grafted)
+
+    return roots_grafted_linear
+
+def grafting_to_existing_hermitian(roots_grafted_hermitian,root_to_be_grafted,magnetic_space_group_cart_spatial,lattice_basis,type_hermitian,tolerance=1e-3):
+    """
+    Attempt to graft a new tree onto an existing collection of trees, the tree's root is hermitian child
+
+    This function checks if `root_to_be_grafted` is the Hermitian conjugate of any root
+    already in the `roots_grafted_hermitian` collection. If a Hermitian relationship is found,
+    the new tree is grafted onto the matching root as a hermitian child.
+
+    Grafting Strategy:
+    -----------------
+    This function implements an "early exit" strategy:
+    - Iterate through existing Hermitian-grafted trees.
+    - Check each one for a Hermitian relationship with the new tree.
+    - On the first match, graft and immediately return True.
+    - If no matches are found after checking all, return False.
+
+    Use Case:
+    --------
+    This is called when imposing Hermiticity constraints on the hopping parameters.
+    As each new root is encountered, we check if it is the conjugate of a root
+    we have already processed.
+
+    Args:
+        roots_grafted_hermitian (list): List of root vertex objects representing
+                                        roots that have already been processed.
+                                        IMPORTANT: Modified in-place when grafting occurs
+                                        (tree structures grow, but list itself is unchanged).
+        root_to_be_grafted  (vertex):  New root vertex attempting to be grafted.
+                                        If grafting succeeds:
+                                     - Becomes a hermitian child of a root in roots_grafted_hermitian
+                                     - is_root changes from True to False
+                                     - type changes from None to type_hermitian
+                                     - Entire subtree moves with it
+                                     If grafting fails:
+                                     - Remains independent
+        magnetic_space_group_cart_spatial  (list): Magnetic  space group spatial part operations in Cartesian coordinates.
+        lattice_basis (np.ndarray): Primitive lattice basis vectors.
+        type_hermitian (str): String identifier for Hermitian constraint type ("hermitian").
+        tolerance  (float): Numerical tolerance for comparisons (default: 1e-3).
+
+    Returns:
+        bool: True if root_to_be_grafted was successfully grafted onto one of the
+              existing roots in roots_grafted_hermitian.
+              False if no Hermitian relationship found with any existing root.
+
+    Physical Meaning:
+    ----------------
+     If grafting succeeds with root1 ∈ roots_grafted_hermitian, the hopping matrix T
+    is constrained by:
+    (i)  for delta=1, no time reversal,
+         T(root_to_be_grafted) = [[V1(g)⊗U(g)] @ T(root1) @ [V2(g)†⊗U(g)†]]†
+    (ii) for delta=-1, there is time reversal
+            T(root_to_be_grafted)  = [[V1(g)⊗~U(g)] @ T(root1)* @ [V2(g)†⊗~U(g)†]]†
+
+    """
+    # Iterate through each root that has already been processed
+    for root1 in roots_grafted_hermitian:
+        # Attempt to graft the new root onto the existing root1 as a Hermitian child
+        # add_to_root_hermitian handles the check and the structural update if successful
+        success = add_to_root_hermitian(
+            root1=root1,
+            root2=root_to_be_grafted,
+            magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+            lattice_basis=lattice_basis,
+            type_hermitian=type_hermitian,
+            tolerance=tolerance
+        )
+        if success == True:
+            # Early exit: We found a parent!
+            # The tree is now grafted, so we stop searching.
+            return True
+    # If we finish the loop without returning, no Hermitian relationship was found
+    return False
+
+def tree_grafting_hermitian(roots_all,magnetic_space_group_cart_spatial,lattice_basis,type_hermitian,tolerance=1e-3):
+    """
+    Perform Hermitian tree grafting on all constraint trees.
+    This function implements the symmetry constraint: Hermiticity (H† = H).
+    It iterates through all root vertices and attempts to graft each one onto existing
+    trees if a Hermitian conjugate relationship exists.
+
+    Algorithm:
+    ---------
+    1. Deep copy all roots to avoid modifying the input
+    2. Initialize roots_grafted_hermitian with the 0th root
+    3. For each remaining root:
+        a. Try to graft it onto any existing root in roots_grafted_hermitian
+        b. If grafting succeeds: the root becomes a Hermitian child (dependent)
+        c. If grafting fails: add the root to roots_grafted_hermitian
+    4. Return the final collection of independent roots
+
+    Tree Structure After Grafting:
+    -----------------------------
+    Before:
+        Root A (independent)          Root B (independent)
+        ├── Child A0 (linear)         ├── Child B0 (linear)
+        └── Child A1 (linear)         └── Child B1 (linear)
+
+    After (if B is Hermitian conjugate of A):
+        Root A
+        ├── Child A0 (linear)
+        ├── Child A1 (linear)
+        └── Root B (hermitian) ← Now a child of A!
+            ├── Child B0 (linear)
+            └── Child B1 (linear)
+    Physical Meaning:
+    ----------------
+    For tight-binding models, Hermiticity requires:
+        H† = H  =>  T(i ← j) = T(j ← i)†
+    If root B is grafted as Hermitian child of root A:
+    (i)  for delta=1, no time reversal,
+         T(B) = [[V1(g)⊗U(g)] @ T(A) @ [V2(g)†⊗U(g)†]]†
+    (ii) for delta=-1, there is time reversal
+         T(B)  = [[V1(g)⊗~U(g)] @ T(A)* @ [V2(g)†⊗~U(g)†]]†
+    Args:
+        roots_all (list): List of all root vertex objects from generate_all_trees_for_unit_cell.
+                          Each root represents an independent constraint tree built from
+                          space group symmetry around a center atom.
+        magnetic_space_group_cart_spatial (list of np.ndarray): magnetic space group spatial part operations in Cartesian
+                                                      coordinates using cif origin.
+                                                      Shape: num_ops × 3 × 4 matrices [R|t]
+        lattice_basis (np.ndarray): Primitive lattice basis vectors (3×3 array).
+                                    Each row is a basis vector in Cartesian coordinates
+                                    using cif origin.
+        type_hermitian (str): String identifier for Hermitian constraint type.
+                              value: "hermitian".
+                              This label is assigned to grafted hermitian roots.
+        tolerance  (float, optional): Numerical tolerance for coordinate and distance
+                                     comparisons. Default: 1e-3
+
+    Returns:
+        list: Collection of  root vertex objects after Hermitian grafting.
+              Each root in this list is a family of hopping matrices under linear or hermitian constraint
+        Structure:
+                    - Roots that were successfully grafted as Hermitian children are NOT in this list
+                    - Their subtrees are now attached to their parent roots
+                    The number of roots decreases: len(returned_list) ≤ len(roots_all)
+     Side Effects:
+        - Creates deep copy of roots_all (input is not modified)
+        - Modifies the copied tree structures in-place during grafting
+        - Trees grow as Hermitian children are added
+        - Some roots lose their root status (is_root: True → False)
+    Algorithm Complexity:
+        Time: O(n² × m) where:
+             n = len(roots_all)
+             m = number of space group operations
+        Space: O(n) for deep copy of all roots
+
+    Notes:
+        - Order matters: first root becomes basis for grafting
+        - "First match wins" strategy in grafting_to_existing_hermitian
+        - Deep copy ensures input roots_all remains unchanged
+        - Grafted roots maintain their entire subtree (children move with parent)
+    """
+    # ==============================================================================
+    # STEP 1: Initialize working variables
+    # ==============================================================================
+    # Get total number of roots to process
+    # Deep copy all roots to avoid modifying the input
+    # CRITICAL: This creates completely independent tree structures
+    # - Each root and its entire subtree (children) are copied
+    # - Parent-child references within each tree are preserved in the copy
+    # - But the copied trees are independent of the original roots_all
+    roots_all_num = len(roots_all)
+    roots_all_copy = deepcopy(roots_all)
+    roots_grafted_hermitian = [roots_all_copy[0]]
+    for j in range(1, roots_all_num):
+        root_to_be_grafted = roots_all_copy[j]
+        was_grafted = grafting_to_existing_hermitian(
+            roots_grafted_hermitian=roots_grafted_hermitian,
+            root_to_be_grafted=root_to_be_grafted,
+            magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+            lattice_basis=lattice_basis,
+            type_hermitian=type_hermitian,
+            tolerance=tolerance
+        )
+        if was_grafted:
+            pass
+        else:
+            roots_grafted_hermitian.append(root_to_be_grafted)
+    return roots_grafted_hermitian
+
+def get_hopping_distance(root):
+    """Calculate the distance for a root's hopping"""
+    hopping = root.hopping
+    return np.linalg.norm(hopping.from_atom.cart_coord - hopping.to_atom.cart_coord)
+
+
+def create_hopping_matrix(root, tree_idx):
+    """
+     Create a symbolic hopping matrix for a root's hopping, including spin.
+    Args:
+        root:  vertex object containing the hopping
+        tree_idx:  tree number/index
+
+    Returns:
+        sympy.Matrix: Hopping matrix with symbolic elements T^{tree_idx}_{i,j}
+
+    """
+    hopping_root = root.hopping
+    # Get orbitals directly from atom objects
+    to_orbitals = hopping_root.to_atom.get_orbital_names()
+    from_orbitals = hopping_root.from_atom.get_orbital_names()
+    # Get dimensions (multiply by 2 for spin up/down)
+    n_to = len(to_orbitals) * 2
+    n_from = len(from_orbitals) * 2
+    # Create symbolic matrix
+    T = sp.zeros(n_to, n_from)
+    spins = ['up', 'down']
+    # Fill with symbolic elements matching the Kronecker product order
+    for i, to_orb in enumerate(to_orbitals):
+        for si, s_to in enumerate(spins):
+            row_idx = i * 2 + si  # Matches np.kron(V_to, spinor_mat)
+
+            for j, from_orb in enumerate(from_orbitals):
+                for sj, s_from in enumerate(spins):
+                    col_idx = j * 2 + sj  # Matches np.kron(V_from, spinor_mat)
+
+                    symbol_name = f"T^{{{tree_idx}}}_{{{to_orb}_{s_to},{from_orb}_{s_from}}}"
+                    T[row_idx, col_idx] = sp.Symbol(symbol_name)
+    return T
+
+
+
+def find_root_stabilizer(root,lattice_basis,magnetic_space_group_cart_spatial,tolerance=1e-3):
+    """
+    Find stabilizer operations for a hopping root
+    Args:
+        root: vertex object containing the seed hopping (root.hopping)
+        lattice_basis: 3x3 array of primitive lattice basis vectors
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial
+                                           part matrices [R|t] in Cartesian coords
+        tolerance:  Numerical tolerance for coordinate comparisons (default: 1e-3)
+
+    Returns: list of list, [[op_idx0, n_vec0],...]
+
+    """
+    to_atom = root.hopping.to_atom
+    from_atom = root.hopping.from_atom
+
+    to_atom_cart_coord = to_atom.cart_coord
+    from_atom_cart_coord = from_atom.cart_coord
+
+    # Get lattice basis vectors
+    a0, a1, a2 = lattice_basis
+    lattice_matrix = np.column_stack([a0, a1, a2])
+    root_stabilizer = []
+    for op_idx, group_mat in enumerate(magnetic_space_group_cart_spatial):
+        R, t = get_rotation_translation(magnetic_space_group_cart_spatial, op_idx)
+        # Apply symmetry operation to both atoms
+        to_atom_transformed = R @ to_atom_cart_coord + t
+        from_atom_transformed = R @ from_atom_cart_coord + t
+        # Compute difference vectors
+        diff_to = to_atom_transformed - to_atom_cart_coord
+        diff_from = from_atom_transformed - from_atom_cart_coord
+        # Check if both differences are the SAME lattice vector
+        diff = diff_to - diff_from
+        if np.linalg.norm(diff) < tolerance:
+            # Both atoms translated by same lattice vector
+            # Verify it's actually a lattice vector
+            n_vector = np.linalg.solve(lattice_matrix, diff_to)
+            n_rounded = np.round(n_vector)
+            if np.allclose(n_vector, n_rounded, atol=tolerance):
+                root_stabilizer.append([op_idx,n_rounded])
+            else:
+                continue
+    return root_stabilizer
+
+def find_root_swapper(root,lattice_basis,magnetic_space_group_cart_spatial,tolerance=1e-3):
+    """
+    Find magnetic space group spatial part operations that swap the two atoms in a hopping.
+    A swapper operation g = (R|t) satisfies:
+        R @ to_atom + t + n·basis = from_atom
+        R @ from_atom + t + n·basis = to_atom
+    where n = [n0, n1, n2] is the same lattice shift for both transformations.
+    This constraint applies when the hopping is between atoms of the same
+    Wyckoff position type. It leads to additional symmetry constraints on
+    the hopping matrix:
+    (i)  for delta=1, no time reversal,
+          T = [V(g)⊗U(g)] @ T† @ [V(g)†⊗U(g)†]
+    (ii) for delta=-1, there is time reversal
+         T  = [V(g)⊗~U(g)] @ T*† @ [V2(g)†⊗~U(g)†]
+
+
+
+    Args:
+        root: vertex object containing the hopping
+        lattice_basis: Primitive lattice basis vectors (3×3 array),
+                      each row is a basis vector
+        magnetic_space_group_cart_spatial: List of magnetic space group spatial part matrices in Cartesian
+                                coordinates (shape: num_ops × 3 × 4)
+        tolerance: Numerical tolerance for comparison (default: 1e-3)
+
+
+    Returns:
+         list of list: [[op_idx0, n_vec0],...], indices of magnetic space group spatial part operations that swap the two atoms, with n_vec
+              Empty list if atoms have different Wyckoff position types.
+
+
+    """
+    # swapping constraint requires that the two atoms have the same Wyckoff position
+    # Extract atoms from hopping
+    to_atom = root.hopping.to_atom
+    from_atom = root.hopping.from_atom
+    # Check if atoms have the same Wyckoff position type
+    # Swapping only makes sense for atoms of the same Wyckoff position type
+    if to_atom.position_name!=from_atom.position_name:
+        return []
+    # Get Cartesian coordinates
+    to_atom_cart_coord = to_atom.cart_coord
+    from_atom_cart_coord = from_atom.cart_coord
+    # Get lattice basis vectors
+    a0, a1, a2 = lattice_basis
+    lattice_matrix = np.column_stack([a0, a1, a2])
+    root_swapper = []
+    for op_idx, group_mat in enumerate(magnetic_space_group_cart_spatial):
+        R, t = get_rotation_translation(magnetic_space_group_cart_spatial, op_idx)
+        # Apply symmetry operation to both atoms
+        to_atom_transformed = R @ to_atom_cart_coord + t
+        from_atom_transformed = R @ from_atom_cart_coord + t
+
+        diff_from_to_transformed = from_atom_cart_coord - to_atom_transformed
+        diff_to_from_transformed = to_atom_cart_coord - from_atom_transformed
+
+        diff_vec = diff_from_to_transformed - diff_to_from_transformed
+        if np.linalg.norm(diff_vec)<tolerance:
+            n_vector = np.linalg.solve(lattice_matrix,diff_from_to_transformed)
+            n_rounded = np.round(n_vector)
+            if np.allclose(n_vector, n_rounded, atol=tolerance):
+                root_swapper.append([op_idx,n_rounded])
+            else:
+                continue
+    return root_swapper
+
+
+def compute_U_tilde(U):
+    """
+    Computes the time-reversed spinor representation matrix.
+    Args:
+        U: a spinor representation matrix (2x2 numpy array)
+    Returns: -i*sigma_y@U*
+
+    """
+    # Define the original Pauli-y matrix: sigma_y = [[0, -i], [i, 0]]
+    sigma_y = np.array([
+        [0, -1j],
+        [1j, 0]
+    ], dtype=complex)
+    # Compute the complex conjugate of U
+    U_star = np.conj(U)
+    # Perform the matrix multiplication: -i * sigma_y @ U*
+    U_tilde = -1j * sigma_y @ U_star
+    return U_tilde
+
+def get_stabilizer_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+    """
+    Generate the symbolic algebraic constraints imposed by stabilizer operations
+    on the independent hopping matrix of a root vertex.
+
+    Args:
+        root:  vertex object containing the seed hopping.
+        tree_idx:  Integer index of the tree (used for naming symbolic variables).
+        lattice_basis: 3x3 array of primitive lattice basis vectors.
+        magnetic_space_group_cart_spatial:  List of spatial part matrices [R|t].
+        spinor_mat_representation: List of transformed spinor representation matrices U(g) depending on delta
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        tolerance: Numerical tolerance   for floating-point comparison.
+
+    Returns:
+
+    """
+    # Create hopping matrix
+    T = create_hopping_matrix(root, tree_idx)
+    # sp.pprint(T)
+    root.hopping.T = deepcopy(T)
+    # Get atom information
+    root_to_atom = root.hopping.to_atom
+    root_from_atom = root.hopping.from_atom
+    # Get stabilizer operations
+    root_stabilizer = list(find_root_stabilizer(root, lattice_basis, magnetic_space_group_cart_spatial, tolerance))
+    # print(f"root_stabilizer={root_stabilizer}")
+    # Row-major vectorization of the original T matrix
+    T_vec = T.reshape(T.rows * T.cols, 1)
+    # sp.pprint(T_vec)
+    T_vec_left=deepcopy(T_vec)
+    stab_constraints_all = []
+    for stab_ind,op_idx_n_vec in  enumerate(root_stabilizer):
+        op_idx,n_vec=op_idx_n_vec
+        delta=delta_vec[op_idx]
+        assert np.isclose(delta, 1, atol=1e-9) or np.isclose(delta, -1, atol=1e-9)
+        # Get representation matrices directly from atoms
+        V_to = root_to_atom.get_numpy_representation_matrix(op_idx)
+        V_from = root_from_atom.get_numpy_representation_matrix(op_idx)
+        spinor_mat=spinor_mat_representation[op_idx]
+        action_mat_left=np.kron(V_to, spinor_mat)
+        action_mat_right=np.kron(V_from.conj().T,spinor_mat.conj().T)
+        action_on_vectorized_T=np.kron(action_mat_left,action_mat_right.T)
+
+        stab_constraints_all.append({
+            'op_idx': op_idx,
+            "delta": delta,
+            "action_on_vectorized_T": action_on_vectorized_T,
+            'T_vec_left': deepcopy(T_vec_left),
+            'kind': "stabilizer"
+
+        })
+
+
+
+    return {
+        'T': T,
+        'stab_constraints_all': stab_constraints_all,
+    }
+
+
+
+def get_swapping_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+    """
+    Generate the symbolic algebraic constraints imposed by swapping operations
+    on the independent hopping matrix of a root vertex.
+    Args:
+        root:  vertex object containing the seed hopping.
+        tree_idx: Integer index of the tree (used for naming symbolic variables).
+        lattice_basis:  3x3 array of primitive lattice basis vectors.
+        magnetic_space_group_cart_spatial: List of spatial part matrices [R|t].
+        spinor_mat_representation: List of transformed spinor representation matrices U(g) depending on delta
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        tolerance: Numerical tolerance   for floating-point comparison.
+
+    Returns:
+
+    """
+    # Create hopping matrix
+    T = create_hopping_matrix(root, tree_idx)
+    root.hopping.T = deepcopy(T)
+    # Get atom information
+    root_to_atom = root.hopping.to_atom
+    root_from_atom = root.hopping.from_atom
+    if  root_to_atom.position_name!=root_from_atom.position_name:
+        return {}
+    # Get stabilizer operations
+    root_swapper = list(find_root_swapper(root, lattice_basis, magnetic_space_group_cart_spatial, tolerance))
+    # print(f"root_swapper={root_swapper}")
+    # Row-major vectorization of the original T matrix
+    T_vec = T.reshape(T.rows * T.cols, 1)
+    T_vec_left = deepcopy(T_vec)
+    swapping_constraints_all=[]
+    for swap_ind, op_idx_n_vec in  enumerate(root_swapper):
+        op_idx,n_vec=op_idx_n_vec
+        delta = delta_vec[op_idx]
+        assert np.isclose(delta, 1, atol=1e-9) or np.isclose(delta, -1, atol=1e-9)
+        # Get representation matrices directly from atoms
+        V_to = root_to_atom.get_numpy_representation_matrix(op_idx)
+        V_from = root_from_atom.get_numpy_representation_matrix(op_idx)
+        spinor_mat = spinor_mat_representation[op_idx]
+        action_mat_left = np.kron(V_to, spinor_mat)
+        action_mat_right = np.kron(V_from.conj().T, spinor_mat.conj().T)
+        action_on_vectorized_T = np.kron(action_mat_left, action_mat_right.T)
+        swapping_constraints_all.append({
+            'op_idx': op_idx,
+            "delta": delta,
+            "action_on_vectorized_T": action_on_vectorized_T,
+            'T_vec_left': deepcopy(T_vec_left),
+            'kind': "swapper"
+        })
+
+    return {
+        'T': T,
+        'swapping_constraints_all':swapping_constraints_all
+    }
+
+
+def get_rref_numerical(matrix, tolerance=1e-3):
+    """
+    Computes the Reduced Row Echelon Form (RREF) of a matrix numerically.
+    Uses scipy.linalg.lu for fast Fortran-backed Gaussian elimination (REF),
+    followed by back-substitution to achieve RREF.
+    """
+    if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+        return matrix, []
+
+    P, L, U = scipy.linalg.lu(matrix)
+    rows, cols = U.shape
+    pivot_cols = []
+
+    # Compact U by moving non-zero rows to the top
+    current_row = 0
+    for r in range(rows):
+        non_zeros = np.where(np.abs(U[r, :]) > tolerance)[0]
+        if len(non_zeros) == 0:
+            continue
+
+        pivot_col = non_zeros[0]
+        pivot_cols.append(pivot_col)
+
+        # Move row r to current_row if they are different (shifts zero rows down)
+        if r != current_row:
+            U[current_row, :] = U[r, :]
+            U[r, :] = 0.0
+
+        # Normalize the pivot row
+        U[current_row, :] = U[current_row, :] / U[current_row, pivot_col]
+
+        # Eliminate above the pivot to achieve Reduced Row Echelon Form
+        for i in range(current_row):
+            factor = U[i, pivot_col]
+            if np.abs(factor) > tolerance:
+                U[i, :] -= factor * U[current_row, :]
+
+        current_row += 1
+
+    # Clean up floating point noise
+    U[np.abs(U) < tolerance] = 0.0
+
+    return U, pivot_cols
+
+
+def split_complex_symbols(T_matrix):
+    """
+    Replace each complex symbol T_ij with T_ij_re + I*T_ij_im
+
+    Args:
+        T_matrix: sympy.Matrix with complex symbols
+
+    Returns:
+        T_split: Matrix with split real/imaginary symbols
+        symbol_map: Dict mapping original → (real, imag) symbols
+    """
+    symbol_map = {}
+    T_split = T_matrix.copy()
+
+    for symbol in T_matrix.free_symbols:
+        # Create real and imaginary parts
+        symbol_str = str(symbol)
+        real_symbol = sp.Symbol(f"re_{symbol_str}", real=True)
+        imag_symbol = sp.Symbol(f"im_{symbol_str}", real=True)
+
+        # Replace in matrix
+        T_split = T_split.subs(symbol, real_symbol + sp.I * imag_symbol)
+        # sp.pprint(real_symbol + sp.I * imag_symbol)
+
+        # Store mapping
+        symbol_map[symbol] = real_symbol+sp.I*imag_symbol
+
+    return T_split, symbol_map
+
+
+def get_stabilizer_constraint_linear_equation_system(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+    """
+    obtaining all equations for stabilizer constraints, split symbols into real and imaginary parts
+    Args:
+        root:  vertex object containing the seed hopping.
+        tree_idx: Integer index of the tree.
+        lattice_basis: 3x3 array of primitive lattice basis vectors.
+        magnetic_space_group_cart_spatial:  List of spatial part matrices [R|t].
+        spinor_mat_representation: List of transformed spinor representation matrices U(g).
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        tolerance: Numerical tolerance.
+
+    Returns:
+        Dictionary containing the symbolic matrices, the symbol map, and the numerical constraint matrix M_total for stabilizer constraint
+
+    """
+    # Get the stabilizer constraints and the action matrices
+    constraints_data = get_stabilizer_constraints(
+        root=root,
+        tree_idx=tree_idx,
+        lattice_basis=lattice_basis,
+        magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+        spinor_mat_representation=spinor_mat_representation,
+        delta_vec=delta_vec,
+        tolerance=tolerance
+    )
+    T = constraints_data['T']
+    stab_constraints_all = constraints_data['stab_constraints_all']
+    # Vectorize T into a column vector
+    N = T.rows * T.cols
+    T_vec = T.reshape(N, 1)
+    T_vec_split,symbol_map=split_complex_symbols(T_vec)
+    # Extract real and imaginary symbolic vectors to form the full unknown vector X
+    T_vec_real = sp.zeros(N, 1)
+    T_vec_imag = sp.zeros(N, 1)
+    for i in range(N):
+        sym = T_vec[i, 0]
+        split_expr = symbol_map[sym]
+        # split_expr is of the form: re_sym + I * im_sym
+        re_part, im_part = split_expr.as_real_imag()
+        T_vec_real[i, 0] = re_part
+        T_vec_imag[i, 0] = im_part
+
+    # The full unknown vector X = [Re(T_vec); Im(T_vec)]
+    X_vec = sp.Matrix.vstack(T_vec_real, T_vec_imag)
+    # Build the numerical constraint matrix M_total
+    I = np.eye(N)
+    constraint_matrices = []
+    for constraint in stab_constraints_all:
+        delta = constraint['delta']
+        action_mat = constraint['action_on_vectorized_T']
+        # Extract real and imaginary parts of the action matrix
+        A = np.real(action_mat)
+        B = np.imag(action_mat)
+        if np.isclose(delta, 1.0, atol=1e-9):
+            # Eq 165: delta = 1, no time reversal
+            # [ A - I   -B    ]
+            # [ B        A - I ]
+            top_row = np.hstack([A - I, -B])
+            bottom_row = np.hstack([B, A - I])
+            M = np.vstack([top_row, bottom_row])
+        elif np.isclose(delta, -1.0, atol=1e-9):
+            # Eq 169: delta = -1, with time reversal
+            # [ A - I    B     ]
+            # [ B       -A - I ]
+            top_row = np.hstack([A - I, B])
+            bottom_row = np.hstack([B, -A - I])
+            M = np.vstack([top_row, bottom_row])
+        else:
+            raise ValueError(f"Unexpected delta value: {delta}. Expected 1.0 or -1.0.")
+        constraint_matrices.append(M)
+
+    # Combine all constraints into a single large matrix if there are any stabilizers
+    if len(constraint_matrices) > 0:
+        M_total = np.vstack(constraint_matrices)
+    else:
+        # If no stabilizers, return an empty matrix of appropriate shape (0 equations, 2N variables)
+        M_total = np.zeros((0, 2 * N))
+    return {
+        'T': T,
+        'T_vec': T_vec,
+        'T_vec_split': T_vec_split,
+        'T_vec_real': T_vec_real,
+        'T_vec_imag': T_vec_imag,
+        'X_vec': X_vec,
+        'symbol_map': symbol_map,
+        'stabilizer_constraint_total': M_total,
+        'N': N
+    }
+
+
+def get_swapping_constraint_linear_equation_system(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+    """
+    obtaining all equations for swapping constraints, split symbols into real and imaginary parts
+    Args:
+        root:  vertex object containing the seed hopping.
+        tree_idx: Integer index of the tree.
+        lattice_basis: 3x3 array of primitive lattice basis vectors.
+        magnetic_space_group_cart_spatial: List of spatial part matrices [R|t].
+        spinor_mat_representation: List of transformed spinor representation matrices U(g).
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        tolerance: Numerical tolerance.
+
+    Returns:
+Dictionary containing the symbolic matrices, the symbol map, and the numerical constraint matrix M_total for swapping constraint
+    """
+    # Get the swapping constraints and the action matrices
+    constraints_data=get_swapping_constraints(root=root,
+                                              tree_idx=tree_idx,
+                                              lattice_basis=lattice_basis,
+                                              magnetic_space_group_cart_spatial=magnetic_space_group_cart_spatial,
+                                              spinor_mat_representation=spinor_mat_representation,
+                                              delta_vec=delta_vec,
+                                              tolerance=tolerance)
+    if len(constraints_data) == 0:
+        return {}
+
+    T = constraints_data['T']
+    swapping_constraints_all=constraints_data["swapping_constraints_all"]
+
+    # Vectorize T into a column vector
+    N = T.rows * T.cols
+    T_vec = T.reshape(N, 1)
+    T_vec_split, symbol_map = split_complex_symbols(T_vec)
+    # Extract real and imaginary symbolic vectors to form the full unknown vector X
+    T_vec_real = sp.zeros(N, 1)
+    T_vec_imag = sp.zeros(N, 1)
+    for i in range(N):
+        sym = T_vec[i, 0]
+        split_expr = symbol_map[sym]
+        # split_expr is of the form: re_sym + I * im_sym
+        re_part, im_part = split_expr.as_real_imag()
+        T_vec_real[i, 0] = re_part
+        T_vec_imag[i, 0] = im_part
+    # The full unknown vector X = [Re(T_vec); Im(T_vec)]
+    X_vec = sp.Matrix.vstack(T_vec_real, T_vec_imag)
+    # Build the numerical constraint matrix M_total
+    I = np.eye(N)
+    K = np.zeros((N, N))
+    # Vectorized construction of K
+    dim = T.rows
+    row_idx = np.arange(N)
+    col_idx = (row_idx % dim) * dim + (row_idx // dim)
+    K[row_idx, col_idx] = 1.0
+    constraint_matrices = []
+    for constraint in swapping_constraints_all:
+        delta = constraint['delta']
+        action_mat = constraint['action_on_vectorized_T']
+        # Apply the commutation matrix K to account for the transpose in T^dagger or T^T
+        C = action_mat @ K
+        C_R = np.real(C)
+        C_I = np.imag(C)
+        if np.isclose(delta, 1.0, atol=1e-9):
+            top_row = np.hstack([C_R - I, C_I])
+            bottom_row = np.hstack([C_I, -(C_R + I)])
+            M = np.vstack([top_row, bottom_row])
+        elif np.isclose(delta, -1.0, atol=1e-9):
+            top_row = np.hstack([C_R - I, -C_I])
+            bottom_row = np.hstack([C_I, C_R - I])
+            M = np.vstack([top_row, bottom_row])
+        else:
+            raise ValueError(f"Unexpected delta value: {delta}. Expected 1.0 or -1.0.")
+        constraint_matrices.append(M)
+    # Combine all constraints into a single large matrix
+    if len(constraint_matrices) > 0:
+        M_total = np.vstack(constraint_matrices)
+    else:
+        M_total = np.zeros((0, 2 * N))
+    return {
+        'T': T,
+        'T_vec': T_vec,
+        'T_vec_split': T_vec_split,
+        'T_vec_real': T_vec_real,
+        'T_vec_imag': T_vec_imag,
+        'X_vec': X_vec,
+        'symbol_map': symbol_map,
+        'swapping_constraint_total': M_total,
+        'N': N
+    }
+
+
+def get_dependent_expressions(A_rref, pivot_cols, symbols, tolerance=1e-3):
+    """
+    Express dependent variables in terms of free variables using the numerical RREF matrix.
+    Uses floating-point coefficients directly.
+
+    Args:
+        A_rref: The numerical Reduced Row Echelon Form matrix (NumPy array).
+        pivot_cols: List of indices corresponding to the pivot columns (dependent variables).
+        symbols: SymPy Matrix (column vector) of the symbolic variables.
+        tolerance: Numerical tolerance to filter out floating-point noise.
+
+    Returns:
+        dict: Mapping of dependent SymPy variables to their expressions in terms of free variables.
+    """
+    # 1. Identify Free Variables
+    num_vars = symbols.shape[0]
+    free_var_indices = [i for i in range(num_vars) if i not in pivot_cols]
+    dependent_expressions = {}
+
+    # 2. Iterate through Pivot Columns (Dependent Variables)
+    for row_idx, col_idx in enumerate(pivot_cols):
+        dependent_var = symbols[col_idx, 0]
+        expr_terms = []
+
+        # 3. Build the Expression
+        for free_idx in free_var_indices:
+            # Move free variable term to the RHS (multiply by -1)
+            coeff = -A_rref[row_idx, free_idx]
+
+            # Check tolerance to avoid numerical noise
+            coeff_val = float(coeff)
+
+            # Only add term if coefficient is non-zero
+            if abs(coeff_val) >= tolerance:
+                # Use the floating-point coefficient directly
+                expr_terms.append(coeff_val * symbols[free_idx, 0])
+
+        # 4. Sum terms or set to zero
+        if expr_terms:
+            expression = sum(expr_terms)
+        else:
+            expression = 0.0
+
+        dependent_expressions[dependent_var] = expression
+
+    return dependent_expressions
+
+
+def reconstruct_hopping_matrix(T_original, dependent_expressions):
+    """Reconstruct hopping matrix with only free variables"""
+    T_reconstructed = T_original.copy()
+
+    for dep_var, expr in dependent_expressions.items():
+        T_reconstructed = T_reconstructed.subs(dep_var, expr)
+    return T_reconstructed
+
+
+def analyze_root_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+    """
+    get all constraint equations for a root, use RREF to obtain independent variables
+    Args:
+        root: vertex object containing the seed hopping.
+        tree_idx: Integer index of the tree.
+        lattice_basis:  3x3 array of primitive lattice basis vectors.
+        magnetic_space_group_cart_spatial: List of spatial part matrices [R|t].
+        spinor_mat_representation: List of transformed spinor representation matrices U(g).
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        tolerance: Numerical tolerance.
+
+    Returns:
+        dict: Dictionary containing the original matrix, reconstructed matrix, and constraint data.
+
+    """
+    dict_stabilizer=get_stabilizer_constraint_linear_equation_system(root,
+                                                                     tree_idx,
+                                                                     lattice_basis,
+                                                                     magnetic_space_group_cart_spatial,
+                                                                     spinor_mat_representation,
+                                                                     delta_vec,
+                                                                     tolerance)
+    dict_swapping=get_swapping_constraint_linear_equation_system(root,
+                                                                 tree_idx,
+                                                                 lattice_basis,
+                                                                 magnetic_space_group_cart_spatial,
+                                                                 spinor_mat_representation,
+                                                                 delta_vec,
+                                                                 tolerance)
+    # Retrieve the stabilizer constraint matrix
+    M_stab = dict_stabilizer["stabilizer_constraint_total"]
+    X_vec = dict_stabilizer["X_vec"]
+    T = dict_stabilizer["T"]
+    # If swapping constraints exist, stack them with the stabilizer constraints
+    if dict_swapping:
+        assert dict_stabilizer["X_vec"] == dict_swapping[
+            "X_vec"], "Mismatch in symbolic X vectors between stabilizer and swapper."
+        M_swap = dict_swapping["swapping_constraint_total"]
+        M_total = np.vstack([M_stab, M_swap])
+    else:
+        # If no swapping constraints, the total constraint matrix is just the stabilizer one
+        M_total = M_stab
+    # Compute the Reduced Row Echelon Form (RREF) to find independent variables
+    if M_total.shape[0] > 0:
+        M_rref, pivot_cols = get_rref_numerical(M_total, tolerance)
+    else:
+        # If there are no constraints at all, return empty structures for RREF
+        M_rref = M_total
+        pivot_cols = []
+
+    # Extract the dependent expressions in terms of free variables
+    dependent_expressions = get_dependent_expressions(M_rref, pivot_cols, X_vec, tolerance)
+
+    # Reshape the split vector back into the 2D matrix shape of T
+    T_split = dict_stabilizer['T_vec_split'].reshape(T.rows, T.cols)
+    # sp.pprint(T_split)
+    # Reconstruct the 2D hopping matrix directly
+    T_reconstructed = reconstruct_hopping_matrix(T_split, dependent_expressions)
+    # i=1
+    # j=2
+    # sp.pprint(T_reconstructed)
+    # sp.pprint(T_reconstructed[i,j])
+    # sp.pprint(T_reconstructed[j,i])
+    # sp.pprint(T_reconstructed==T_reconstructed.H)
+    return {
+        'T': T,
+        'T_reconstructed': T_reconstructed,
+        'X_vec': X_vec,
+        'symbol_map': dict_stabilizer['symbol_map'],
+        'M_total': M_total,
+        'M_rref': M_rref,
+        'pivot_cols': pivot_cols,
+        'dependent_expressions': dependent_expressions,
+        'N': dict_stabilizer['N']
+    }
+
+
+def propagate_T_to_child(parent_vertex, child_vertex,spinor_mat_representation,delta_vec,type_linear,type_hermitian, tolerance=1e-3):
+    """
+    Propagates the reconstructed (independent) hopping matrix from a parent vertex
+    to a dependent child vertex by applying the appropriate symmetry transformations.
+
+     In a tight-binding model, if a hopping path (child) is related to another
+      hopping path (parent) by a magnetic symmetry operation g, its
+    hopping matrix T_child is entirely determined by T_parent.
+
+    The transformation depends on:
+    1. The type of constraint (Linear vs. Hermitian conjugate).
+    2. The presence of Time Reversal symmetry (delta = -1).
+
+    Mathematical Transformations:
+    Let L = V_to(g) ⊗ U(g) and R = V_from(g)^† ⊗ U(g)^†.
+
+    - Linear, no Time Reversal (delta = 1):
+      T_child = L @ T_parent @ R
+     - Linear, with Time Reversal (delta = -1):
+       T_child = L @ T_parent^* @ R
+    - Hermitian, no Time Reversal (delta = 1):
+      T_child = (L @ T_parent @ R)^†
+    - Hermitian, with Time Reversal (delta = -1):
+      T_child = (L @ T_parent^* @ R)^†
+
+
+    Args:
+        parent_vertex: The independent root vertex containing the solved T_reconstructed matrix.
+        child_vertex: The dependent vertex where the propagated matrix will be stored.
+        spinor_mat_representation: List of spinor representation matrices U(g), adjusted for time reversal.
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        type_linear: "linear", string identifier for a linear symmetry constraint.
+        type_hermitian: "hermitian", string identifier for a Hermitian symmetry constraint.
+        tolerance: Numerical tolerance for floating-point comparisons (default: 1e-3).
+
+    Returns:
+         None (Modifies child_vertex.hopping.T_reconstructed in-place)
+    """
+
+
+    # Early return if child is None
+    if child_vertex is None:
+        return
+    # Get parent's hopping matrix
+    T_reconstructed_parent=parent_vertex.hopping.T_reconstructed
+    # Get the operation that transforms parent to child
+    op_idx_parent_to_child = child_vertex.hopping.operation_idx
+    # Get representation matrices for parent's atoms under this operation
+    parent_to_atom_V = (parent_vertex.hopping.to_atom.orbital_representations)[op_idx_parent_to_child]
+    parent_from_atom_V = (parent_vertex.hopping.from_atom.orbital_representations)[op_idx_parent_to_child]
+    U_mat_transformed=spinor_mat_representation[op_idx_parent_to_child]
+
+    delta=delta_vec[op_idx_parent_to_child]
+    # Get child type
+    child_type = child_vertex.type
+    action_mat_left=np.kron(parent_to_atom_V,U_mat_transformed)
+    action_mat_right=np.kron(np.conj(parent_from_atom_V.T),np.conj(U_mat_transformed.T))
+    action_mat_left_sp=sp.Matrix(action_mat_left)
+    action_mat_right_sp=sp.Matrix(action_mat_right)
+    if child_type == type_linear:
+        if np.isclose(delta, 1.0, atol=1e-9):
+            T_reconstructed_child=action_mat_left_sp@T_reconstructed_parent@action_mat_right_sp
+        elif np.isclose(delta, -1.0, atol=1e-9):
+            T_reconstructed_child=action_mat_left_sp@T_reconstructed_parent.conjugate()@action_mat_right_sp
+        else:
+            raise ValueError(f"Unexpected delta value: {delta}. Expected 1.0 or -1.0.")
+
+    elif child_type == type_hermitian:
+        if np.isclose(delta, 1.0, atol=1e-9):
+            T_reconstructed_child =(action_mat_left_sp@T_reconstructed_parent@action_mat_right_sp).H
+        elif np.isclose(delta, -1.0, atol=1e-9):
+            T_reconstructed_child =( action_mat_left_sp @ T_reconstructed_parent.conjugate() @ action_mat_right_sp).H
+        else:
+            raise ValueError(f"Unexpected delta value: {delta}. Expected 1.0 or -1.0.")
+
+    else:
+        raise ValueError(f"Unknown child type: {child_type}")
+
+    # Simplify the result
+    T_reconstructed_child= sp.simplify(T_reconstructed_child)
+    # Assign to child
+    child_vertex.hopping.T_reconstructed=T_reconstructed_child
+
+
+
+def propagate_to_all_children(parent_vertex, spinor_mat_representation, delta_vec, type_linear, type_hermitian, tolerance=1e-3):
+    """
+    Propagates the independent hopping matrix T from the root (parent) vertex
+    to all of its descendants in the constraint tree using a Breadth-First Search (BFS).
+
+    Because the constraint tree can have multiple levels (e.g., a root has a child,
+    and that child has its own children due to tree grafting), we must propagate
+    the matrix step-by-step down the hierarchy. The matrix of a grandchild is
+    calculated by applying symmetry operations to its immediate parent (the child),
+    not directly from the root.
+
+    Args:
+        parent_vertex (vertex): The root vertex of the constraint tree containing the independent T matrix.
+        spinor_mat_representation (list): List of spinor representation matrices U(g), adjusted for time reversal.
+        delta_vec (np.ndarray): Array of +/- 1 indicating the presence of time reversal.
+        type_linear (str): String identifier for a linear symmetry constraint.
+        type_hermitian (str): String identifier for a Hermitian symmetry constraint.
+        tolerance (float): Numerical tolerance for floating-point comparisons (default: 1e-3).
+
+    Returns:
+        None (Modifies the T_reconstructed attribute of all descendant vertices in-place)
+    """
+    from collections import deque
+
+    # If the root has no dependent children, there is nothing to propagate
+    if len(parent_vertex.children) == 0:
+        return
+
+    # The queue stores tuples of (immediate_parent, child_node, depth_level)
+    # This allows us to process the tree level-by-level (Breadth-First Search)
+    queue = deque()
+
+    # Initialize the queue with all immediate children of the root (level 1)
+    for child in parent_vertex.children:
+        queue.append((parent_vertex, child, 1))
+
+    # Track statistics for debugging or logging purposes
+    total_propagated = 0
+    max_level = 0
+
+    # Process the queue level-by-level until all descendants are updated
+    while queue:
+        # Pop the next relationship to process
+        parent, child, level = queue.popleft()
+
+        # Propagate the T matrix from the immediate parent to this child.
+        # BUG FIX: Changed parent_vertex=parent_vertex to parent_vertex=parent
+        # to ensure grandchildren inherit from their immediate parent, not the root.
+        propagate_T_to_child(
+            parent_vertex=parent,
+            child_vertex=child,
+            spinor_mat_representation=spinor_mat_representation,
+            delta_vec=delta_vec,
+            type_linear=type_linear,
+            type_hermitian=type_hermitian,
+            tolerance=tolerance
+        )
+
+        # Update statistics
+        total_propagated += 1
+        max_level = max(max_level, level)
+
+        # Add all children of the current child (grandchildren of the original parent)
+        # to the queue so they can be processed in the next level of the BFS.
+        for grandchild in child.children:
+            queue.append((child, grandchild, level + 1))
+
+
+def print_node_with_matrix(vertex, prefix="", is_last=True, max_depth=None, current_depth=0, tolerance=1e-3):
+    """
+    Recursively print tree structure with T_reconstructed for each node,
+    cleaning up small floating-point noise before printing.
+
+    Args:
+        vertex: vertex object to print
+        prefix: String prefix for indentation (used in recursion)
+        is_last: Boolean indicating if this is the last child
+        max_depth: Maximum depth to print (None = unlimited)
+        current_depth: Current depth in recursion
+        tolerance: Threshold below which floating point numbers are set to 0
+    """
+    # Check max depth
+    if max_depth is not None and current_depth > max_depth:
+        return
+
+    # Determine node styling
+    if vertex.is_root:
+        node_label = "ROOT"
+        connector = "╔═══ "
+    else:
+        node_label = f"CHILD ({vertex.type})"
+        connector = "└── " if is_last else "├── "
+
+    # Build node description
+    hop = vertex.hopping
+    to_cell = f"[{hop.to_atom.n0},{hop.to_atom.n1},{hop.to_atom.n2}]"
+    from_cell = f"[{hop.from_atom.n0},{hop.from_atom.n1},{hop.from_atom.n2}]"
+    basic_info = f"{hop.to_atom.wyckoff_instance_id}{to_cell} ← {hop.from_atom.wyckoff_instance_id}{from_cell}"
+
+    # Print main node line
+    print(f"{prefix}{connector}{node_label}: {basic_info}, op={hop.operation_idx}, d={hop.distance:.4f}")
+
+    # Determine detail prefix
+    if vertex.is_root:
+        detail_prefix = prefix + "    "
+    else:
+        detail_prefix = prefix + ("    " if is_last else "│   ")
+
+    # Print T_reconstructed if it exists
+    if hasattr(hop, 'T_reconstructed') and hop.T_reconstructed is not None:
+
+        # --- NEW CLEANUP LOGIC ---
+        def clean_expr(expr):
+            """Replace floating point numbers smaller than tolerance with exact 0"""
+            if isinstance(expr, sp.Expr):
+                # Find all floats in the expression and replace small ones with 0
+                return expr.xreplace({n: 0 for n in expr.atoms(sp.Float) if abs(n) < tolerance})
+            return expr
+
+        # Apply cleanup to every element in the matrix
+        cleaned_matrix = hop.T_reconstructed.applyfunc(clean_expr)
+        cleaned_matrix=sp.simplify(sp.expand(cleaned_matrix))
+        cleaned_matrix = cleaned_matrix.applyfunc(clean_expr)
+        # -------------------------
+
+        free_symbols = cleaned_matrix.free_symbols
+        print(f"{detail_prefix}Free parameters: {len(free_symbols)}")
+
+        # Print the cleaned matrix
+        print(f"{detail_prefix}T_reconstructed:")
+        matrix_str = sp.pretty(cleaned_matrix, use_unicode=False)
+        for line in matrix_str.split('\n'):
+            print(f"{detail_prefix}  {line}")
+    else:
+        print(f"{detail_prefix}T_reconstructed: NOT SET")
+
+    # Print separator
+    print(f"{detail_prefix}")
+
+    # Recursively print children
+    if vertex.children:
+        for i, child in enumerate(vertex.children):
+            is_last_child = (i == len(vertex.children) - 1)
+
+            # Determine new prefix for children
+            if vertex.is_root:
+                new_prefix = ""
+            else:
+                new_prefix = prefix + ("    " if is_last else "│   ")
+
+            print_node_with_matrix(child, new_prefix, is_last_child, max_depth, current_depth + 1, tolerance)
+
+
+
+
+def analyze_root_constraints_and_propagate(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+    """
+    analyze hopping matrix constraints of root, propagate hopping matrix to the rest of the tree
+    Args:
+        root: The independent root vertex
+        tree_idx: The dependent vertex where the propagated matrix will be stored.
+        lattice_basis:  3x3 array of primitive lattice basis vectors.
+        magnetic_space_group_cart_spatial: List of spatial part matrices [R|t].
+        spinor_mat_representation:  List of transformed spinor representation matrices U(g).
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        tolerance: Numerical tolerance.
+
+    Returns:
+
+    """
+    dict_rst = analyze_root_constraints(root,
+                                        tree_idx,
+                                        lattice_basis,
+                                        magnetic_space_group_cart_spatial,
+                                        spinor_mat_representation,
+                                        delta_vec,
+                                        tolerance)
+    root.hopping.T_reconstructed=dict_rst["T_reconstructed"]
+    root.hopping.dependent_expressions = dict_rst["dependent_expressions"]
+    propagate_to_all_children(root,spinor_mat_representation,delta_vec,type_linear,type_hermitian,tolerance)
+    # CRITICAL: Return the modified root so the main process can receive the updates
+    return root
+
+
+
+def analyze_root_constraints_worker(args):
+    """
+    Worker function to unpack arguments for pool.map
+    """
+    tree_idx, root, lattice_basis, magnetic_space_group_cart_spatial, spinor_mat_representation, delta_vec, tol = args
+    return (tree_idx, analyze_root_constraints_and_propagate(
+        root, tree_idx, lattice_basis, magnetic_space_group_cart_spatial, spinor_mat_representation, delta_vec, tol
+    )
+            )
+
+
+def initialize_atom_T_tilde_lists(unit_cell_atoms, roots_list):
+    """
+    Traverses the constraint tree forest and initializes the T_tilde_list
+    for each atom in the unit cell.
+    For every hopping found in the trees (center <- neighbor), it adds an entry
+    to the center atom's T_tilde_list.
+    Args:
+        unit_cell_atoms:  List of atomIndex objects in the unit cell. These are the objects that will be modified
+        roots_list:  The forest of constraint trees
+
+    Returns:
+
+    """
+    # 1. Create a lookup map for O(1) access to unit_cell_atoms by their ID
+    ## Note: Values are references to the objects in unit_cell_atoms, not copies.
+    atom_map = {atom.wyckoff_instance_id: atom for atom in unit_cell_atoms}
+    # 2. Define a recursive helper to traverse the trees
+    def traverse_and_init(vertex):
+        hop = vertex.hopping
+        # Identify the IDs
+        to_id = hop.to_atom.wyckoff_instance_id  # Center atom ID
+        from_id = hop.from_atom.wyckoff_instance_id  # Neighbor atom ID
+        # Construct the key: (Center, Neighbor)
+        key = (to_id, from_id)
+        # Find the actual center atom object in our unit_cell_atoms list
+        if to_id in atom_map:
+            target_atom = atom_map[to_id]
+            # Initialize the key with an empty list if it doesn't exist
+            if key not in target_atom.T_tilde_list:
+                target_atom.T_tilde_list[key] = []
+        else:
+            # This indicates a critical data inconsistency
+            raise ValueError(f"Atom ID {to_id} found in hopping data but not in unit_cell_atoms list.")
+
+        # Recursively process all children
+        for child in vertex.children:
+            traverse_and_init(child)
+
+    # 3. Iterate through all roots in the forest
+    #    We filter for actual roots to be safe, though the list should be clean.
+    actual_roots = [root for root in roots_list if root.is_root]
+    if len(actual_roots)!= len(roots_list):
+        # Calculate the difference to provide a helpful error message
+        missing_count = len(roots_list) - len(actual_roots)
+        raise ValueError(
+            f"Inconsistency detected: {missing_count} item(s) in 'roots_list' are not marked as roots (is_root=False)."
+        )
+    for root in actual_roots:
+        traverse_and_init(root)
+
+
+
+def populate_atom_T_tilde_lists(unit_cell_atoms, roots_list, directions_to_study, dim):
+    """
+    Traverses the constraint tree forest and populates the T_tilde_list
+    for each atom in the unit cell.
+
+    For every hopping found (center <- neighbor), it:
+    1. Calculates the phase factor exp(i * k * R_neighbor) based on directions_to_study
+    2. Multiplies the hopping matrix T_reconstructed by this phase
+    3. Appends the result to the list stored in T_tilde_list[(center_id, neighbor_id)]
+
+    Args:
+        unit_cell_atoms: List of atomIndex objects in the unit cell.
+        roots_list: The forest of constraint trees
+        directions_to_study: List of strings indicating directions (e.g., ['x', 'y', 'z']).
+        dim: Dimensionality of the system (1, 2, or 3).
+
+    Returns:
+
+    """
+    # 0. Validation
+    if len(directions_to_study) != dim:
+        raise ValueError(
+            f"Dimension mismatch in populate_atom_T_tilde_lists: dim is {dim}, "
+            f"but found {len(directions_to_study)} active directions in {directions_to_study}. "
+            f"Please ensure 'directions_to_study' length matches 'dim'."
+        )
+    # 1. Define k-vector symbols
+    # We map 'x' -> k0, 'y' -> k1, 'z' -> k2 to maintain consistency with lattice vectors n0, n1, n2
+
+    k0 = sp.Symbol('k0', real=True)
+    k1 = sp.Symbol('k1', real=True)
+    k2 = sp.Symbol('k2', real=True)
+    # 2. Create a lookup map. Note: 'atom' here is a reference to the object in unit_cell_atoms.
+    atom_map = {atom.wyckoff_instance_id: atom for atom in unit_cell_atoms}
+
+    # 3. Define recursive helper
+    def traverse_and_populate(vertex):
+        hop = vertex.hopping
+
+        # --- A. Validation ---
+        if not hasattr(hop, 'T_reconstructed') or hop.T_reconstructed is None:
+            raise ValueError(f"Vertex {hop.to_atom.wyckoff_instance_id}<-{hop.from_atom.wyckoff_instance_id} "
+                             f"(op={hop.operation_idx}) missing T_reconstructed")
+
+        # --- B. Identify Atoms ---
+        to_id = hop.to_atom.wyckoff_instance_id  # Center atom (destination)
+        from_id = hop.from_atom.wyckoff_instance_id  # Neighbor atom (source)
+        # --- C. Calculate Phase Factor ---
+        # The hopping is from a neighbor at cell [n0, n1, n2] to center at [0,0,0]
+        # The Bloch phase factor is exp(i * k * R).
+        # R is the lattice vector of the neighbor relative to the center.
+        n0 = hop.from_atom.n0
+        n1 = hop.from_atom.n1
+        n2 = hop.from_atom.n2
+        # Optimization: If cell is [0,0,0], phase is exactly 1
+        if n0 == 0 and n1 == 0 and n2 == 0:
+            phase_factor = 1
+        else:
+            # Build the dot product k * R based on active directions
+            dot_product = 0
+            # Check 'x' direction (associated with n0 and k0)
+            if 'x' in directions_to_study:
+                dot_product += n0 * k0
+            # Check 'y' direction (associated with n1 and k1)
+            if 'y' in directions_to_study:
+                dot_product += n1 * k1
+
+            # Check 'z' direction (associated with n2 and k2)
+            if 'z' in directions_to_study:
+                dot_product += n2 * k2
+            # Compute exponential
+            if dot_product == 0:
+                phase_factor = 1
+            else:
+                phase_factor = sp.exp(sp.I * dot_product)
+
+        # --- D. Construct Term ---
+        T_matrix = hop.T_reconstructed
+        term = T_matrix * phase_factor
+        # --- E. Store in Dictionary ---
+        if to_id in atom_map:
+            target_atom = atom_map[to_id]
+            # The key identifies the specific pair of basis atoms involved
+            key = (to_id, from_id)
+
+            # Ensure the list exists for this pair (enforced by initialize_atom_T_tilde_lists)
+            if key not in target_atom.T_tilde_list:
+                raise KeyError(
+                    f"Key {key} not found in T_tilde_list for atom {to_id}. "
+                    "Each atom in unit_cell_atoms must be initialized with initialize_atom_T_tilde_lists."
+                )
+
+            # Append the phase-modulated matrix
+            target_atom.T_tilde_list[key].append(term)
+        else:
+            raise ValueError(f"Atom ID {to_id} found in hopping but not in unit_cell_atoms list.")
+        # --- F. Recursion ---
+        # Traverse all children to capture derived hoppings
+        for child in vertex.children:
+            traverse_and_populate(child)
+
+    # 4. Iterate through all trees
+    # Filter for actual roots to ensure we start at the top of trees
+    actual_roots = [root for root in roots_list if root.is_root]
+    if len(actual_roots) != len(roots_list):
+        missing_count = len(roots_list) - len(actual_roots)
+        raise ValueError(
+            f"Inconsistency detected: {missing_count} item(s) in 'roots_list' are not marked as roots (is_root=False)."
+        )
+    for root in actual_roots:
+        traverse_and_populate(root)
+
+
+
+def sum_atom_T_tilde_lists(unit_cell_atoms):
+    """
+    Iterates through each atom in the unit cell and sums the phase-modulated
+    matrices stored in T_tilde_list.
+    """
+    for i, atom in enumerate(unit_cell_atoms):
+        for key, matrix_list in atom.T_tilde_list.items():
+            if not matrix_list:
+                raise ValueError(
+                    f"Error processing Atom {atom.wyckoff_instance_id}: "
+                    f"The interaction key {key} exists in T_tilde_list but contains no matrices to sum."
+                )
+
+            # Fast summation using Python's built-in sum (much faster than a loop with +=)
+            total_matrix = sum(matrix_list[1:], matrix_list[0])
+
+            # Use expand instead of simplify! It is 10x-100x faster.
+            total_matrix_fast = sp.expand(total_matrix)
+
+            atom.T_tilde_val[key] = total_matrix_fast
+
+
+
+def check_vertex_T_reconstructed_invariant(vertex, lattice_basis, magnetic_space_group_cart_spatial, spinor_mat_representation,
+                                           delta_vec, tolerance=1e-3):
+    """
+    Checks if the reconstructed hopping matrix of a vertex is invariant under its stabilizer operations.
+    """
+    vertex_stabilizer = list(find_root_stabilizer(vertex, lattice_basis, magnetic_space_group_cart_spatial, tolerance))
+
+    # Get atoms
+    to_atom = vertex.hopping.to_atom
+    from_atom = vertex.hopping.from_atom
+
+    # Get the hopping matrix
+    if not hasattr(vertex.hopping, 'T_reconstructed') or vertex.hopping.T_reconstructed is None:
+        return {
+            'is_invariant': False,
+            'stabilizer_ops': vertex_stabilizer,
+            'max_diff': None,
+            'violations': [],
+            'error': 'T_reconstructed not set'
+        }
+
+    T_reconstructed = vertex.hopping.T_reconstructed
+
+    # Check each stabilizer operation
+    violations = []
+    max_diff_overall = 0.0
+
+    for op_idx, n_vec in vertex_stabilizer:
+
+        max_coeff_this_op = 0.0
+        is_zero = True
+
+        delta = delta_vec[op_idx]
+
+        # Get representation matrices
+        V_to = to_atom.get_representation_matrix(op_idx)
+        V_from = from_atom.get_representation_matrix(op_idx)
+        U_mat_transformed = spinor_mat_representation[op_idx]
+
+        action_mat_left = np.kron(V_to, U_mat_transformed)
+        action_mat_right = np.kron(V_from.conj().T, U_mat_transformed.conj().T)
+
+        action_mat_left_sp = sp.Matrix(action_mat_left)
+        action_mat_right_sp = sp.Matrix(action_mat_right)
+
+        # Transform the matrix
+        if np.isclose(delta, 1, 1e-9):
+            transformed_T_reconstructed = action_mat_left_sp @ T_reconstructed @ action_mat_right_sp
+        elif np.isclose(delta, -1, 1e-9):
+            transformed_T_reconstructed = action_mat_left_sp @ sp.conjugate(T_reconstructed) @ action_mat_right_sp
+        else:
+            raise ValueError(f"wrong numerical value: delta={delta}")
+
+        # Compute difference
+        T_diff = T_reconstructed - transformed_T_reconstructed
+        T_diff_simplified = sp.simplify(T_diff)
+
+        for i in range(T_diff_simplified.shape[0]):
+            for j in range(T_diff_simplified.shape[1]):
+                element = T_diff_simplified[i, j]
+
+                # If element has free symbols, check coefficients
+                if element.free_symbols:
+                    # Expand the expression to get all terms
+                    element_expanded = sp.expand(element)
+                    symbols_in_element = element_expanded.free_symbols
+
+                    # Check coefficient of each symbol
+                    for sym in symbols_in_element:
+                        coeff = element_expanded.coeff(sym)
+                        try:
+                            # FIX: Use complex() instead of float() to handle imaginary noise
+                            coeff_val = abs(complex(coeff))
+                            max_coeff_this_op = max(max_coeff_this_op, coeff_val)
+
+                            if coeff_val > tolerance:
+                                is_zero = False
+                        except Exception:
+                            is_zero = False
+
+                    # Also check the constant term (coefficient of 1)
+                    const_term = element_expanded.as_coeff_Add()[0]
+                    if const_term != 0:
+                        try:
+                            # FIX: Use complex() here as well
+                            const_val = abs(complex(const_term))
+                            max_coeff_this_op = max(max_coeff_this_op, const_val)
+
+                            if const_val > tolerance:
+                                is_zero = False
+                        except Exception:
+                            is_zero = False
+
+                else:
+                    # No free symbols, just a number
+                    try:
+                        element_val = complex(element)
+                        element_abs = abs(element_val)
+                        max_coeff_this_op = max(max_coeff_this_op, element_abs)
+
+                        if element_abs > tolerance:
+                            is_zero = False
+                    except Exception:
+                        if element != 0:
+                            is_zero = False
+
+        max_diff_overall = max(max_diff_overall, max_coeff_this_op)
+
+        if not is_zero:
+            violations.append((op_idx, max_coeff_this_op))
+
+    # Overall invariance check
+    is_invariant = (len(violations) == 0)
+
+    return {
+        'is_invariant': is_invariant,
+        'stabilizer_ops': vertex_stabilizer,
+        'max_diff': max_diff_overall,
+        'violations': violations,
+        'num_stabilizers': len(vertex_stabilizer),
+        'num_violations': len(violations)
+    }
+
+
+def check_tree_T_reconstructed_invariant(vertex, lattice_basis, magnetic_space_group_cart_spatial,
+                                         spinor_mat_representation, delta_vec, tolerance=1e-3):
+    """
+    Recursively checks if the reconstructed hopping matrix of EVERY vertex in a tree
+    is invariant under its respective stabilizer operations.
+
+    Args:
+        vertex: The starting vertex object (usually the root of the tree).
+        lattice_basis: 3x3 array of primitive lattice basis vectors.
+        magnetic_space_group_cart_spatial: List of spatial part matrices [R|t].
+        spinor_mat_representation: List of transformed spinor representation matrices U(g).
+        delta_vec: Array of ±1 indicating the presence of time reversal.
+        tolerance: Numerical tolerance for floating-point comparisons.
+
+    Returns:
+        dict: A dictionary containing:
+            - 'all_invariant' (bool): True if EVERY node in the tree is invariant.
+            - 'node_results' (list): A list of detailed results for each node checked.
+    """
+    # 1. Check the current vertex
+    current_result = check_vertex_T_reconstructed_invariant(
+        vertex,
+        lattice_basis,
+        magnetic_space_group_cart_spatial,
+        spinor_mat_representation,
+        delta_vec,
+        tolerance
+    )
+
+    # Add a descriptive identifier to the result so we know which node this is
+    hop = vertex.hopping
+    to_cell = f"[{hop.to_atom.n0},{hop.to_atom.n1},{hop.to_atom.n2}]"
+    from_cell = f"[{hop.from_atom.n0},{hop.from_atom.n1},{hop.from_atom.n2}]"
+    node_id = f"{hop.to_atom.wyckoff_instance_id}{to_cell} <- {hop.from_atom.wyckoff_instance_id}{from_cell} (op={hop.operation_idx})"
+
+    current_result['node_id'] = node_id
+    current_result['is_root'] = vertex.is_root
+    current_result['type'] = vertex.type
+
+    # Initialize the aggregate tracking variables
+    all_invariant = current_result['is_invariant']
+    all_results = [current_result]
+
+    # 2. Recursively check all children
+    for child in vertex.children:
+        child_tree_result = check_tree_T_reconstructed_invariant(
+            child,
+            lattice_basis,
+            magnetic_space_group_cart_spatial,
+            spinor_mat_representation,
+            delta_vec,
+            tolerance
+        )
+
+        # Aggregate the boolean status
+        all_invariant = all_invariant and child_tree_result['all_invariant']
+
+        # Aggregate the detailed reports
+        all_results.extend(child_tree_result['node_results'])
+
+    return {
+        'all_invariant': all_invariant,
+        'node_results': all_results
+    }
+
+def check_hamiltonian_hermitian(H, tolerance=1e-3):
+    """
+    Robustly checks if a symbolic Hamiltonian matrix is Hermitian (H = H†).
+    Accounts for floating-point noise and unsimplified 1.0 * x vs x terms.
+
+    Args:
+        H: SymPy Matrix representing the Hamiltonian.
+        tolerance: Numerical tolerance for floating-point comparisons.
+
+    Returns:
+        dict: A dictionary containing:
+            - 'is_hermitian' (bool): True if the matrix is Hermitian within tolerance.
+            - 'max_diff' (float): The maximum numerical difference found.
+            - 'violations' (list): List of tuples containing the (row, col) index and the violating expression.
+    """
+    print("Checking Hermiticity of the total Hamiltonian...")
+
+    # Compute the difference between H and its conjugate transpose
+    H_diff = H - H.H
+
+    rows, cols = H_diff.shape
+    violations = []
+    max_diff_overall = 0.0
+
+    for i in range(rows):
+        for j in range(cols):
+            element = H_diff[i, j]
+
+            # Fast skip for exact zeros
+            if element == 0:
+                continue
+
+            # Expand to ensure terms are separated properly
+            element_expanded = sp.expand(element)
+            is_zero = True
+
+            # Break the expression into a list of added terms
+            # e.g., "A + B - C" becomes (A, B, -C)
+            terms = sp.Add.make_args(element_expanded)
+
+            for term in terms:
+                # Extract the numerical coefficient from the term
+                # e.g., "6.12e-17 * I * re_T * exp(I*k0)" -> coeff = 6.12e-17 * I
+                coeff, _ = term.as_coeff_Mul()
+
+                try:
+                    # Convert the SymPy Number to a Python complex, then take magnitude
+                    coeff_val = abs(complex(coeff))
+                    max_diff_overall = max(max_diff_overall, coeff_val)
+
+                    if coeff_val > tolerance:
+                        is_zero = False
+                except Exception:
+                    # Fallback if something unexpected happens
+                    is_zero = False
+
+            # Record the violation if any term's coefficient exceeds the tolerance
+            if not is_zero:
+                violations.append(((i, j), element_expanded))
+
+    return {
+        'is_hermitian': len(violations) == 0,
+        'max_diff': max_diff_overall,
+        'violations': violations
+    }
+
+
+def write_dependent_relations_to_file(roots_solved, filename):
+    """
+    Writes the algebraic relationship between dependent and independent
+    hopping variables to a text file.
+    """
+    with open(filename, 'w') as f:
+        f.write("# ==============================================================================\n")
+        f.write("# DEPENDENT HOPPING PARAMETER RELATIONS\n")
+        f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("# ==============================================================================\n\n")
+
+        for tree_idx, root in enumerate(roots_solved):
+            dep_exprs = getattr(root.hopping, 'dependent_expressions', {})
+
+            if not dep_exprs:
+                continue
+
+            hop = root.hopping
+            f.write(f"Tree {tree_idx}: Distance = {hop.distance:.6f}\n")
+            f.write(f"Hopping: {hop.to_atom.position_name} <- {hop.from_atom.position_name}\n")
+            f.write("-" * 80 + "\n")
+
+            # Sort the dependent variables for cleaner output
+            sorted_deps = sorted(dep_exprs.keys(), key=lambda x: str(x))
+
+            for dep_var in sorted_deps:
+                expr = dep_exprs[dep_var]
+                f.write(f"{dep_var} = {expr}\n")
+            f.write("\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Main Computation Function
+# ==============================================================================
 
 def run_general_computation(confFileName):
     """
@@ -304,6 +3847,229 @@ def run_general_computation(confFileName):
         sys.exit(save_err_code)
 
     print("=" * 80)
+
+    # 5. generate atoms in unit cell
+    tol=1e-3
+    lattice_basis = np.array(parsed_config['lattice_basis'])
+    unit_cell_atoms=generate_atoms_in_unit_cell(parsed_config, magnetic_space_group_cart_spatial, lattice_basis,origin_cart, repr_s, repr_p, repr_d, repr_f, spinor_mat_representation,delta_vec,tol)
+    radius=parsed_config["truncation_radius"] # Cutoff distance in Cartesian coordinates
+
+    # 6. Find all neighbors for each atom in the unit cell
+    # For each atom in the reference unit cell [0,0,0], find all neighboring atoms within
+    # the specified radius by searching through neighboring unit cells.
+    # This creates the hopping connectivity network for tight-binding calculations.
+
+    # Only atoms within this distance from center are considered neighbors
+    # FIXME: search_range must be sufficiently large to include all atoms within radius
+    # TODO: may need an algorithm to deal with this in the next version of code
+    # TODO: especially the vacuum layer length
+
+    search_range=10 # Number of unit cells to search in each direction
+    # in general, for 1d, 2d, 3d problems, the search ranges is always [-10,10] × [-10,10] × [-10,10] ,
+    #because there is vacuum  layer
+    # for a 2d problem, the resulting range is often  [-10,10] × [-10,10] × [-1,1] ,
+    #since the 2d layer has thickness
+    # if atoms are found beyond vacuum layer, then set these hoppings=0
+    # Larger values find more distant neighbors but increase computation time
+    #TODO: should be computed from a0,a1, radius, vacuum layer length, etc
+
+    all_neighbors = {}  # Dictionary mapping unit cell atom index → list of neighbor atomIndex objects
+    # Key: integer index of center atom in unit_cell_atoms\
+    # Value: list of atomIndex objects representing all neighbors within radius
+    # Neighbors can be in different unit cells (n0, n1, n2)
+
+    for i, unit_atom in enumerate(unit_cell_atoms):
+        # Find all neighbors within the specified radius for this center atom
+        # 1. Searches through neighboring unit cells within search_range
+        # 2. Constructs atomIndex objects for atoms in those cells
+        # 3. Filters by distance (keeps only atoms within radius)
+        # 4. Returns sorted list by distance
+        neighbors = compute_dist(
+            center_atom=unit_atom,  # Center atom (in unit cell [0,0,0])
+            unit_cell_atoms=unit_cell_atoms,  # Template atoms to replicate in neighboring cells
+            radius=radius,# Distance cutoff in Cartesian coordinates,
+            search_range=search_range ,  # How many cells to search in each direction
+        )
+        # Store the neighbor list using the unit cell atom index as key
+        # This creates a complete connectivity map: center_atom_idx --- [neighbor1, neighbor2, ...]
+        all_neighbors[i] = neighbors
+        # Print summary for each center atom
+        print(f"Unit cell atom {i} ({unit_atom.wyckoff_instance_id}): found {len(neighbors)} neighbors within radius {radius}")
+
+    # 7. Find identity operation
+    # Locate the identity operation E in the list of space group operations.
+    # The identity operation E = {identity matrix|0|delta=1} is characterized by:
+    # - Rotation part: 3×3 identity matrix (no operation)
+    # - Translation part: zero vector (no translation)
+    # - delta=1, no time reversal
+    #
+    # The identity operation index is crucial because:
+    # 1). It will be assigned to seed hoppings (root vertices in the constraint tree)
+    #    Seed hoppings are those containing identity operation
+    # 2). Root vertices in the vertex tree have hopping.operation_idx == identity_idx
+    #
+    # This index will be used throughout the code to:
+    # - Distinguish between seed hoppings and derived hoppings
+    # - Initialize root vertices in the constraint tree
+    # - Verify that orbital representations preserve identity (V[identity_idx] = identity matrix)
+    identity_idx = find_identity_operation(
+        magnetic_space_group_cart_spatial,
+        spinor_mat_representation,
+        delta_vec,tolerance=1e-8
+    )
+    # print atom orbital representations for all unit cell atoms
+    print("\n" + "=" * 80)
+    print("PRINTING ATOM ORBITAL REPRESENTATIONS")
+    print("=" * 80)
+    for i, atom in enumerate(unit_cell_atoms):
+        print(f"\nUnit cell atom {i} ({atom.wyckoff_instance_id}):")
+        print(f"  {atom}")
+        print(f"  Orbitals: {atom.get_orbital_names()}")
+        if atom.orbital_representations:
+            print(f"  Number of operations: {len(atom.orbital_representations)}")
+            V_identity = atom.get_representation_matrix(identity_idx)
+            print(f" Orbital representation's identity matrix shape: {V_identity.shape}")
+            print(f" Orbital representation's identity present: {np.allclose(V_identity, np.eye(V_identity.shape[0]))}")
+    print("\n" + "=" * 80)
+    print("ORBITAL REPRESENTATION VERIFICATION COMPLETE")
+    print("=" * 80)
+    # 8. generate trees
+    roots_from_eq_class=generate_all_trees_for_unit_cell(unit_cell_atoms,all_neighbors,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,identity_idx,type_linear,parsed_config,tol)
+    # 9. tree grafting, find linear first, hermitian second
+    roots_grafted_linear=tree_grafting_linear(roots_from_eq_class,
+                                              magnetic_space_group_cart_spatial,
+                                              lattice_basis,
+                                              type_linear,tol)
+    roots_grafted_hermitian=tree_grafting_hermitian(roots_grafted_linear,
+                                                    magnetic_space_group_cart_spatial,
+                                                    lattice_basis,
+                                                    type_hermitian,tol
+                                                    )
+    all_roots_sorted = sorted(roots_grafted_hermitian, key=get_hopping_distance)
+    print_all_trees(all_roots_sorted)
+
+    # 10. analyze root constraints in parallel
+    # Prepare arguments for parallel processing
+    args_list = [
+        (tree_idx, root, lattice_basis, magnetic_space_group_cart_spatial, spinor_mat_representation, delta_vec, tol)
+        for tree_idx, root in enumerate(all_roots_sorted)
+    ]
+
+    # Determine number of processes
+    # Use all available cores, or specify a different number
+    num_processes =12
+    print(f"Using {num_processes} processes for parallel computation...")
+
+    with Pool(processes=num_processes) as pool:
+        # Use imap for progress tracking (optional) or map for simplicity
+        results = pool.map(analyze_root_constraints_worker, args_list)
+    print("Parallel processing complete!")
+    roots_solved=[root for _,root in results]
+    print(f"✓ Analyzed {len(roots_solved)} roots in parallel")
+    print("=" * 80)
+    for tree_idx, root in enumerate(roots_solved):
+        hop = root.hopping
+        print(f"\n{'─' * 80}")
+        print(f"Tree {tree_idx}: Distance = {hop.distance:.6f}, "
+              f"Hopping: {hop.to_atom.position_name} ← {hop.from_atom.position_name}")
+        print(f"{'─' * 80}")
+        print_node_with_matrix(root, max_depth=None)
+    print("\n" + "=" * 80)
+    # 11. compute k-space Hamiltonian
+    initialize_atom_T_tilde_lists(unit_cell_atoms,roots_solved)
+    populate_atom_T_tilde_lists(unit_cell_atoms,roots_solved,directions_to_study,search_dim)
+    sum_atom_T_tilde_lists(unit_cell_atoms)
+    T_tilde_tot_obj=T_tilde_total(unit_cell_atoms)
+    H=T_tilde_tot_obj.construct_total_hamiltonian()
+    config_file_path = parsed_config["config_file_path"]
+    config_dir = Path(config_file_path).parent
+    out_matrix_file_name=str(config_dir/H_latex_file_name)
+
+    T_tilde_tot_obj.write_hamiltonian_to_latex(out_matrix_file_name)
+    out_html_file_name=str(config_dir/H_html_file_name)
+    T_tilde_tot_obj.write_to_html(out_html_file_name,directions_to_study,1e-3)
+
+    # Save Hamiltonian for later use
+    print("\n" + "=" * 80)
+    print("SAVING HAMILTONIAN DATA")
+    print("=" * 80)
+    k_symbols = []
+    for direction in directions_to_study:
+        d_str = str(direction).lower().strip()
+        if d_str == 'x':
+            k_symbols.append('k0')
+        elif d_str == 'y':
+            k_symbols.append('k1')
+        elif d_str == 'z':
+            k_symbols.append('k2')
+        else:
+            # Fallback for unknown direction
+            raise ValueError(f"Unknown direction '{direction}' found in directions_to_study. "
+                             f"Allowed values are 'x', 'y', 'z'.")
+    # Sort k_symbols to ensure consistent order (e.g., k0, k2 instead of k2, k0)
+    k_symbols.sort()
+    print(f"Active directions: {directions_to_study}")
+    print(f"Mapped k-symbols: {k_symbols}")
+    # Prepare comprehensive data package for saving
+    hamiltonian_data = {
+        # Core Hamiltonian data
+        'hamiltonian': H,  # The symbolic Hamiltonian matrix
+        'hamiltonian_dimension': T_tilde_tot_obj.hamiltonian_dimension,
+
+        # ADD THIS LINE: Get the row/column names (basis vectors)
+        'basis_explanation': T_tilde_tot_obj.get_hamiltonian_basis_explanation(),
+
+        # Atom and orbital information
+        'unit_cell_atoms': unit_cell_atoms,  # Full atom objects with orbital info
+        'sorted_wyckoff_instance_ids': T_tilde_tot_obj.sorted_wyckoff_instance_ids,
+        'block_dimensions': T_tilde_tot_obj.block_dimensions,  # Block sizes
+
+        # Block matrix data
+        'T_tilde_blocks': T_tilde_tot_obj.T_tilde_from_unit_cell_atoms,  # Individual blocks
+
+        # Lattice and symmetry information
+        'lattice_basis': lattice_basis,
+        'space_group_origin_cartesian': origin_cart,
+
+        # Configuration
+        'config': parsed_config,
+
+        # k-vector symbols (dimension-dependent)
+        'k_symbols': k_symbols,  # 1D: ['k0'], 2D: ['k0', 'k1'], 3D: ['k0', 'k1', 'k2']
+
+        # Metadata
+        'creation_date': datetime.now().isoformat(),
+        'version': '0.0'
+    }
+    # Save as pickle
+    out_pickle_file = str(config_dir/H_pkl_file_name)
+    with open(out_pickle_file, 'wb') as f:
+        pickle.dump(hamiltonian_data, f)
+    print(f"T_tilde_tot_obj.block_dimensions={T_tilde_tot_obj.block_dimensions}")
+
+    # 12. Create parameter input file
+    print("\n" + "=" * 80)
+    print("CREATING PARAMETER INPUT FILE")
+    print("=" * 80)
+    param_input_file = str(config_dir/hopping_parameters_template_file_name)
+    param_info = T_tilde_tot_obj.create_parameter_input_file(param_input_file)
+    relations_file = str(config_dir /relations_file_name)
+    write_dependent_relations_to_file(roots_solved, relations_file)
+    print(f"✓ Created dependent relations file: {relations_file}")
+
+    print(f"\nNext steps:")
+    print(f"1. Edit the file: {param_input_file}")
+    print(f"2. Fill in values for all independent parameters")
+    print("=" * 80)
+
+
+
+
+
+
+
+
+
 
 def main():
 
