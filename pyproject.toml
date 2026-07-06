@@ -23,7 +23,8 @@ dependencies = [
 # Format: "terminal-command = package.module:function"
 mstb-init-from-cif = "magsymtb.cli:run_init_from_cif"
 mstb-general = "magsymtb.cli:run_general"
-
+mstb-run-diag="magsymtb.cli:run_diagonalization"
+mstb-run-plot-band="magsymtb.cli:run_plot_band"
 
 [tool.setuptools.packages.find]
 # This tells the builder that your actual package code is inside 'py_src'
