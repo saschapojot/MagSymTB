@@ -748,7 +748,7 @@ def search_one_equivalent_atom(seed_atom,target_cart_coord, neighbor_atoms_copy,
         target_cart_coord: 3D Cartesian coordinate to search for (numpy array)
                             This is  the result of applying a symmetry operation
                             to a seed atom's position
-        neighbor_atoms_copy: set of atomIndex objects representing all neighbors
+        neighbor_atoms_copy: list of atomIndex objects representing all neighbors
                          of a center atom within some cutoff radius
         tolerance:   Numerical tolerance for coordinate comparison (default: 1e-3)
                     Two positions are considered identical if their Euclidean distance
@@ -832,7 +832,7 @@ def get_equivalent_sets_for_one_center_atom(center_atom_idx, unit_cell_atoms, al
     # This is a REFERENCE (not copied) - center_atom points to the same object in unit_cell_atoms
     center_atom = unit_cell_atoms[center_atom_idx]
     # print(f"center_atom={center_atom}")
-    # Create a working copy of neighbors as a set
+    # Create a working copy of neighbors as a list
     # IMPORTANT: Deep copy to DECOUPLE from input all_neighbors
     # ----------------------------------------------------------
     # Why deep copy?
@@ -847,12 +847,8 @@ def get_equivalent_sets_for_one_center_atom(center_atom_idx, unit_cell_atoms, al
     # - obj_A and obj_A' are DIFFERENT objects at DIFFERENT memory addresses
     # - obj_A and obj_A' have the SAME data (same coordinates, same element, etc.)
     # - Removing obj_A' from neighbor_atoms_copy does NOT affect all_neighbors
-    #
-    # Why set instead of list?
-    # - O(1) removal with set.remove() vs O(n) with list.remove()
-    # - No duplicates guaranteed
-    # - Order doesn't matter (symmetry operations find all equivalents)
-    neighbor_atoms_copy = set(deepcopy(all_neighbors[center_atom_idx]))
+
+    neighbor_atoms_copy = deepcopy(all_neighbors[center_atom_idx])
     # Store all equivalence classes (list of lists of tuples)
     equivalence_classes = []
     # Class ID counter (increments for each new equivalence class found)
@@ -869,19 +865,18 @@ def get_equivalent_sets_for_one_center_atom(center_atom_idx, unit_cell_atoms, al
         # Pop one seed atom from neighbor_atoms_copy
         # This will be the representative atom for this equivalence class
         #
-        # CRITICAL: set.pop() returns a REFERENCE, not a copy
+        # CRITICAL: list.pop() returns a REFERENCE, not a copy
         # ------------------------------------------------
-        # - set.pop() removes and returns a reference to an arbitrary element
-        # - Order is implementation-dependent (hash table internals, not guaranteed)
+        # - list.pop() removes and returns a reference to the last element
         # - Returns a REFERENCE to one of the deep-copied atomIndex objects
-        # - The atomIndex object is removed from the set but still exists in memory
+        # - The atomIndex object is removed from the list but still exists in memory
         # - seed_atom now holds a reference to that object
         #
         # Example:
         # -------
-        # Before: neighbor_atoms_copy = {obj_A', obj_B', obj_C'}
+        # Before: neighbor_atoms_copy = [obj_A', obj_B', obj_C']
         # After:  seed_atom = obj_A' (reference to the copied object)
-        #         neighbor_atoms_copy = {obj_B', obj_C'}
+        #         neighbor_atoms_copy = [obj_A', obj_B']
         #
         # Remember: obj_A' is a COPY (independent of the original obj_A in all_neighbors)
         #
@@ -962,18 +957,17 @@ def get_equivalent_sets_for_one_center_atom(center_atom_idx, unit_cell_atoms, al
                     # - operation_idx: Which space group operation maps seed → matched_neighbor
                     # - deepcopy(n_vec): Copy of lattice translation vector (n_vec is numpy array, mutable)
                     current_equivalence_class.append((matched_neighbor, operation_idx, deepcopy(n_vec)))
-                    # Remove from the working set (it's now classified)
+                    # Remove from the working list (it's now classified)
                     # CRITICAL: This only works because matched_neighbor is a REFERENCE
                     # ----------------------------------------------------------------
-                    # set.remove() searches for object by identity (memory address)
+                    # list.remove() searches for the exact object reference
                     # - matched_neighbor points to the exact same object in neighbor_atoms_copy
-                    # - Python finds the object by comparing memory addresses (fast, O(1))
                     # - If matched_neighbor were a copy, remove() would raise KeyError
                     #
                     # After removal:
                     # - The atomIndex object still exists in memory (referenced by matched_neighbor
                     #   and by the tuple in current_equivalence_class)
-                    # - It's just no longer in the neighbor_atoms_copy set
+                    # - It's just no longer in the neighbor_atoms_copy list
                     # - The original object in all_neighbors is completely unaffected
                     neighbor_atoms_copy.remove(matched_neighbor)
         # ==============================================================================
