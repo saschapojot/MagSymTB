@@ -3658,7 +3658,27 @@ def write_dependent_relations_to_file(roots_solved, filename):
 
 
 
+def sort_roots_custom(roots_list):
+    """
+    Sorts a list of root vertices based on:
+    1. Hopping distance
+    2. to_atom's sort key
+    3. from_atom's sort key
+    """
+    sorted_roots = sorted(
+        roots_list,
+        key=lambda root: (
+            # 1. Primary: Hopping distance
+            root.hopping.distance,
 
+            # 2. Secondary: to_atom's natural sort key and coordinates
+            get_atom_sort_key(root.hopping.to_atom),
+
+            # 3. Tertiary: from_atom's natural sort key and coordinates
+            get_atom_sort_key(root.hopping.from_atom)
+        )
+    )
+    return sorted_roots
 
 
 
@@ -3978,7 +3998,15 @@ def run_general_computation(confFileName):
                                                     lattice_basis,
                                                     type_hermitian,tol
                                                     )
-    all_roots_sorted = sorted(roots_grafted_hermitian, key=get_hopping_distance)
+    # Updated sorting: distance -> to_atom -> from_atom
+    all_roots_sorted = sorted(
+        roots_grafted_hermitian,
+        key=lambda r: (
+            r.hopping.distance,
+            get_atom_sort_key(r.hopping.to_atom),
+            get_atom_sort_key(r.hopping.from_atom)
+        )
+    )
     print_all_trees(all_roots_sorted)
 
     # 10. analyze root constraints in parallel
