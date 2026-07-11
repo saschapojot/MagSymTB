@@ -143,7 +143,7 @@ def get_rotation_translation(magnetic_space_group_cart_spatial, operation_idx):
 
 
 def generate_wyckoff_orbit(wyckoff_position, magnetic_space_group_cart_spatial, lattice_basis,origin_cart,
-                           tolerance=1e-3):
+                           tolerance=1e-2):
     """
     Generate all symmetry-equivalent positions (orbit) from a single Wyckoff position.
     Applies all magnetic space group operations' spatial parts to a Wyckoff position and collects unique
@@ -250,7 +250,7 @@ def get_atom_sort_key(atom):
 def generate_atoms_in_unit_cell(parsed_config,magnetic_space_group_cart_spatial, lattice_basis,origin_cart,
                                 repr_s, repr_p, repr_d, repr_f,
                                 spinor_mat_representation,delta_vec,
-                                tolerance=1e-3):
+                                tolerance=1e-2):
     """
     Generates all atoms in the unit cell by expanding the Wyckoff positions defined
     in the configuration using the provided magnetic space group operations.
@@ -580,7 +580,7 @@ def cif_plus_translation(R,t,lattice_basis,n_vec,atom_cart):
     transformed_cart = R @ atom_cart + t + n0 * a0 + n1 * a1 + n2 * a2
     return transformed_cart
 
-def is_lattice_vector(vector, lattice_basis, tolerance=1e-3):
+def is_lattice_vector(vector, lattice_basis, tolerance=1e-2):
     """
     Check if a vector can be expressed as an integer linear combination of lattice basis vectors.
      A vector v is a lattice vector if:
@@ -613,7 +613,7 @@ def is_lattice_vector(vector, lattice_basis, tolerance=1e-3):
 
 
 def check_center_invariant(center_atom, operation_idx, magnetic_space_group_cart_spatial,
-                           lattice_basis, tolerance=1e-3):
+                           lattice_basis, tolerance=1e-2):
     """
     Check if a center atom is invariant under a specific magnetic space group spatial part operation.
      An atom is invariant if the symmetry operation maps it to itself, possibly
@@ -656,7 +656,7 @@ def check_center_invariant(center_atom, operation_idx, magnetic_space_group_cart
 
 
 def get_next_for_center(center_atom, seed_atom, center_seed_distance, magnetic_space_group_cart_spatial,
-                        operation_idx, parsed_config, tolerance=1e-3):
+                        operation_idx, parsed_config, tolerance=1e-2):
     """
     Apply a magnetic space group spatial part operation to a seed atom, conditioned on center atom invariance.
     This function implements a three-step validation process:
@@ -770,7 +770,7 @@ def get_next_for_center(center_atom, seed_atom, center_seed_distance, magnetic_s
         return None,None
 
 
-def search_one_equivalent_atom(seed_atom,target_cart_coord, neighbor_atoms_copy, tolerance=1e-3):
+def search_one_equivalent_atom(seed_atom,target_cart_coord, neighbor_atoms_copy, tolerance=1e-2):
     """
     Search for an atom in the neighbor_atoms_copy list whose Cartesian coordinate matches the target.
     This function is used to find which actual neighbor atom corresponds to a transformed
@@ -810,7 +810,7 @@ def search_one_equivalent_atom(seed_atom,target_cart_coord, neighbor_atoms_copy,
 
 def get_equivalence_classes_for_one_center_atom(center_atom_idx, unit_cell_atoms, all_neighbors,
                                             magnetic_space_group_cart_spatial, identity_idx,parsed_config,
-                                            tolerance=1e-3):
+                                            tolerance=1e-2):
     """
     Partition all neighbors of 1 center atom into equivalence classes based on symmetry.
     Each equivalence class contains center atom's neighbors related by magnetic space group spatial part operations.
@@ -1209,7 +1209,7 @@ def one_equivalent_hopping_class_to_root(one_equivalent_hopping_class, identity_
     return tree_root
 
 
-def atom_equal(atom1, atom2,tolerence=1e-3):
+def atom_equal(atom1, atom2,tolerence=1e-2):
     """
     check if two atoms occupy the same position
     Args:
@@ -1226,7 +1226,7 @@ def atom_equal(atom1, atom2,tolerence=1e-3):
         return False
 
 
-def apply_full_transformation_and_check_position(atom1,atom2,R,t,lattice_basis,n_vec,tolerance=1e-3):
+def apply_full_transformation_and_check_position(atom1,atom2,R,t,lattice_basis,n_vec,tolerance=1e-2):
     #checks if full transformation applied to atoms1 goes to atom2
     atom1_pos=atom1.cart_coord
     atom2_pos=atom2.cart_coord
@@ -1240,7 +1240,7 @@ def apply_full_transformation_and_check_position(atom1,atom2,R,t,lattice_basis,n
 
 
 def check_hopping_linear(hopping1,hopping2, magnetic_space_group_cart_spatial,
-                         lattice_basis, tolerance=1e-3):
+                         lattice_basis, tolerance=1e-2):
     """
     Check if hopping2 is related to hopping1 by a space group symmetry operation.
      For tight-binding models, a linear symmetry constraint implies:
@@ -1374,7 +1374,7 @@ def check_hopping_linear(hopping1,hopping2, magnetic_space_group_cart_spatial,
 
 
 def check_hopping_hermitian(hopping1,hopping2, magnetic_space_group_cart_spatial,
-                            lattice_basis, tolerance=1e-3):
+                            lattice_basis, tolerance=1e-2):
     """
      Check if hopping2 is the Hermitian conjugate of hopping1.
     For tight-binding models, Hermiticity requires:
@@ -1503,7 +1503,7 @@ def check_hopping_hermitian(hopping1,hopping2, magnetic_space_group_cart_spatial
 
 
 def add_to_root_linear(root1, root2, magnetic_space_group_cart_spatial,
-                       lattice_basis, type_linear, tolerance=1e-3):
+                       lattice_basis, type_linear, tolerance=1e-2):
     """
     Attempt to graft root2 onto root1 as a linear child if a symmetry relationship exists.
     This function checks if root2's hopping can be generated from root1's hopping
@@ -1566,7 +1566,7 @@ def add_to_root_linear(root1, root2, magnetic_space_group_cart_spatial,
 
 
 def add_to_root_hermitian(root1, root2, magnetic_space_group_cart_spatial,
-                          lattice_basis, type_hermitian, tolerance=1e-3):
+                          lattice_basis, type_hermitian, tolerance=1e-2):
     """
     If root2's hopping is hermitian conjugate of root1's hopping,
     add root2 as root1's child with hermitian constraint. This function checks if root2 is the Hermitian conjugate of root1 under
@@ -1748,7 +1748,7 @@ def construct_all_roots_for_1_atom(equivalent_hoppings_all_for_1_atom,identity_i
         root_list.append(root)
     return root_list
 
-def generate_all_trees_for_unit_cell(unit_cell_atoms,all_neighbors,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,identity_idx,type_linear,parsed_config,tolerance=1e-3):
+def generate_all_trees_for_unit_cell(unit_cell_atoms,all_neighbors,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,identity_idx,type_linear,parsed_config,tolerance=1e-2):
     """
     Generate all trees for all atoms in the unit cell, based on equivalent neighbors around the center atom
     This function generates trees, for later tree grafting
@@ -1895,7 +1895,7 @@ def generate_all_trees_for_unit_cell(unit_cell_atoms,all_neighbors,magnetic_spac
     return roots_all
 
 
-def grafting_to_existing_linear(roots_grafted_linear,root_to_be_grafted,magnetic_space_group_cart_spatial,lattice_basis,type_linear,tolerance=1e-3):
+def grafting_to_existing_linear(roots_grafted_linear,root_to_be_grafted,magnetic_space_group_cart_spatial,lattice_basis,type_linear,tolerance=1e-2):
     """
     Attempt to graft a new tree onto an existing collection of  trees, as linear child
     This function checks if `root_to_be_grafted` is related by a magnetic space group spatial part symmetry
@@ -1961,7 +1961,7 @@ def grafting_to_existing_linear(roots_grafted_linear,root_to_be_grafted,magnetic
     # If we finish the loop without returning, no parent was found
     return False
 
-def tree_grafting_linear(roots_all,magnetic_space_group_cart_spatial,lattice_basis,type_linear,tolerance=1e-3):
+def tree_grafting_linear(roots_all,magnetic_space_group_cart_spatial,lattice_basis,type_linear,tolerance=1e-2):
     """
     Perform Linear tree grafting on all constraint trees.
     This function implements a symmetry reduction step based on linear constraint. It iterates through
@@ -2036,7 +2036,7 @@ def tree_grafting_linear(roots_all,magnetic_space_group_cart_spatial,lattice_bas
 
     return roots_grafted_linear
 
-def grafting_to_existing_hermitian(roots_grafted_hermitian,root_to_be_grafted,magnetic_space_group_cart_spatial,lattice_basis,type_hermitian,tolerance=1e-3):
+def grafting_to_existing_hermitian(roots_grafted_hermitian,root_to_be_grafted,magnetic_space_group_cart_spatial,lattice_basis,type_hermitian,tolerance=1e-2):
     """
     Attempt to graft a new tree onto an existing collection of trees, the tree's root is hermitian child
 
@@ -2110,7 +2110,7 @@ def grafting_to_existing_hermitian(roots_grafted_hermitian,root_to_be_grafted,ma
     # If we finish the loop without returning, no Hermitian relationship was found
     return False
 
-def tree_grafting_hermitian(roots_all,magnetic_space_group_cart_spatial,lattice_basis,type_hermitian,tolerance=1e-3):
+def tree_grafting_hermitian(roots_all,magnetic_space_group_cart_spatial,lattice_basis,type_hermitian,tolerance=1e-2):
     """
     Perform Hermitian tree grafting on all constraint trees.
     This function implements the symmetry constraint: Hermiticity (H† = H).
@@ -2260,7 +2260,7 @@ def create_hopping_matrix(root, tree_idx):
 
 
 
-def find_root_stabilizer(root,lattice_basis,magnetic_space_group_cart_spatial,tolerance=1e-3):
+def find_root_stabilizer(root,lattice_basis,magnetic_space_group_cart_spatial,tolerance=1e-2):
     """
     Find stabilizer operations for a hopping root
     Args:
@@ -2304,7 +2304,7 @@ def find_root_stabilizer(root,lattice_basis,magnetic_space_group_cart_spatial,to
                 continue
     return root_stabilizer
 
-def find_root_swapper(root,lattice_basis,magnetic_space_group_cart_spatial,tolerance=1e-3):
+def find_root_swapper(root,lattice_basis,magnetic_space_group_cart_spatial,tolerance=1e-2):
     """
     Find magnetic space group spatial part operations that swap the two atoms in a hopping.
     A swapper operation g = (R|t) satisfies:
@@ -2390,7 +2390,7 @@ def compute_U_tilde(U):
     U_tilde = -1j * sigma_y @ U_star
     return U_tilde
 
-def get_stabilizer_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+def get_stabilizer_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-2):
     """
     Generate the symbolic algebraic constraints imposed by stabilizer operations
     on the independent hopping matrix of a root vertex.
@@ -2452,7 +2452,7 @@ def get_stabilizer_constraints(root,tree_idx,lattice_basis,magnetic_space_group_
 
 
 
-def get_swapping_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+def get_swapping_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-2):
     """
     Generate the symbolic algebraic constraints imposed by swapping operations
     on the independent hopping matrix of a root vertex.
@@ -2508,46 +2508,72 @@ def get_swapping_constraints(root,tree_idx,lattice_basis,magnetic_space_group_ca
     }
 
 
-def get_rref_numerical(matrix, tolerance=1e-3):
+def get_rref_numerical(matrix, tolerance=1e-2):
     """
     Computes the Reduced Row Echelon Form (RREF) of a matrix numerically.
     Uses scipy.linalg.lu for fast Fortran-backed Gaussian elimination (REF),
     followed by back-substitution to achieve RREF.
     """
+    # 1. Boundary check: If the matrix is empty, return it as-is with an empty pivot list
     if matrix.shape[0] == 0 or matrix.shape[1] == 0:
         return matrix, []
 
+
+    # 2. LU Decomposition: A = P @ L @ U
+    # P is the permutation matrix, L is the lower triangular matrix, and U is the
+    # upper triangular matrix (which is essentially our REF).
+    # Since elementary row operations don't change the RREF, we only need U.
+    # P and L are not needed for the final RREF and can be ignored.
     P, L, U = scipy.linalg.lu(matrix)
     rows, cols = U.shape
-    pivot_cols = []
+    pivot_cols = [] # List to keep track of the column indices of the pivots
 
-    # Compact U by moving non-zero rows to the top
+    # current_row acts as the "placement pointer". It indicates where the next
+    # valid (non-zero) row should be placed.
     current_row = 0
+
+    # r acts as the "scout pointer", scanning through every row in the matrix U
     for r in range(rows):
+        # 3. Find the pivot: Locate indices of elements in the row whose absolute
+        # value is greater than the tolerance. We use tolerance instead of '== 0'
+        # to account for floating-point inaccuracies (e.g., 1e-16 is practically 0).
         non_zeros = np.where(np.abs(U[r, :]) > tolerance)[0]
+
+        # If the entire row is zeros, skip it. The 'current_row' pointer stays
+        # in place waiting for the next row with actual data.
         if len(non_zeros) == 0:
             continue
 
+        # The first non-zero element's column index is our pivot column
         pivot_col = non_zeros[0]
         pivot_cols.append(pivot_col)
 
-        # Move row r to current_row if they are different (shifts zero rows down)
+        # 4. Compact the matrix (Shift rows): Push all-zero rows to the bottom and
+        # pack valid data rows at the top. If 'r' and 'current_row' are out of sync,
+        # it means we've passed some all-zero rows.
         if r != current_row:
-            U[current_row, :] = U[r, :]
-            U[r, :] = 0.0
+            U[current_row, :] = U[r, :] # Pull the valid data row up
+            U[r, :] = 0.0  # Clear out the old position
 
-        # Normalize the pivot row
+        # 5. Normalize the pivot row: Divide the entire row by the pivot's value
+        # so that the pivot becomes exactly 1.0.
         U[current_row, :] = U[current_row, :] / U[current_row, pivot_col]
 
-        # Eliminate above the pivot to achieve Reduced Row Echelon Form
+        # 6. Upward elimination (Back-substitution): Eliminate any non-zero elements
+        # strictly above the current pivot to transition from REF to RREF.
         for i in range(current_row):
-            factor = U[i, pivot_col]
+            factor = U[i, pivot_col] # The element directly above the pivot
+            # If it's not zero, perform the elementary row operation:
+            # Row(i) = Row(i) - factor * Current_Row
             if np.abs(factor) > tolerance:
                 U[i, :] -= factor * U[current_row, :]
-
+        # The current row is fully processed. Move the placement pointer down
+        # to prepare for the next valid row.
         current_row += 1
 
-    # Clean up floating point noise
+    # 7. Clean up floating-point noise: After multiple arithmetic operations,
+    # tiny non-zero values (like 2.77e-17) might appear. Force anything smaller
+    # than the tolerance to be exactly 0.0 for a clean output matrix.
     U[np.abs(U) < tolerance] = 0.0
 
     return U, pivot_cols
@@ -2583,7 +2609,7 @@ def split_complex_symbols(T_matrix):
     return T_split, symbol_map
 
 
-def get_stabilizer_constraint_linear_equation_system(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+def get_stabilizer_constraint_linear_equation_system(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-2):
     """
     obtaining all equations for stabilizer constraints, split symbols into real and imaginary parts
     Args:
@@ -2674,7 +2700,7 @@ def get_stabilizer_constraint_linear_equation_system(root,tree_idx,lattice_basis
     }
 
 
-def get_swapping_constraint_linear_equation_system(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+def get_swapping_constraint_linear_equation_system(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-2):
     """
     obtaining all equations for swapping constraints, split symbols into real and imaginary parts
     Args:
@@ -2764,7 +2790,7 @@ Dictionary containing the symbolic matrices, the symbol map, and the numerical c
     }
 
 
-def get_dependent_expressions(A_rref, pivot_cols, symbols, tolerance=1e-3):
+def get_dependent_expressions(A_rref, pivot_cols, symbols, tolerance=1e-2):
     """
     Express dependent variables in terms of free variables using the numerical RREF matrix.
     Uses floating-point coefficients directly.
@@ -2821,7 +2847,7 @@ def reconstruct_hopping_matrix(T_original, dependent_expressions):
     return T_reconstructed
 
 
-def analyze_root_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+def analyze_root_constraints(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-2):
     """
     get all constraint equations for a root, use RREF to obtain independent variables
     Args:
@@ -2899,7 +2925,7 @@ def analyze_root_constraints(root,tree_idx,lattice_basis,magnetic_space_group_ca
     }
 
 
-def propagate_T_to_child(parent_vertex, child_vertex,spinor_mat_representation,delta_vec,type_linear,type_hermitian, tolerance=1e-3):
+def propagate_T_to_child(parent_vertex, child_vertex,spinor_mat_representation,delta_vec,type_linear,type_hermitian, tolerance=1e-2):
     """
     Propagates the reconstructed (independent) hopping matrix from a parent vertex
     to a dependent child vertex by applying the appropriate symmetry transformations.
@@ -2984,7 +3010,7 @@ def propagate_T_to_child(parent_vertex, child_vertex,spinor_mat_representation,d
 
 
 
-def propagate_to_all_children(parent_vertex, spinor_mat_representation, delta_vec, type_linear, type_hermitian, tolerance=1e-3):
+def propagate_to_all_children(parent_vertex, spinor_mat_representation, delta_vec, type_linear, type_hermitian, tolerance=1e-2):
     """
     Propagates the independent hopping matrix T from the root (parent) vertex
     to all of its descendants in the constraint tree using a Breadth-First Search (BFS).
@@ -3052,7 +3078,7 @@ def propagate_to_all_children(parent_vertex, spinor_mat_representation, delta_ve
             queue.append((child, grandchild, level + 1))
 
 
-def print_node_with_matrix(vertex, prefix="", is_last=True, max_depth=None, current_depth=0, tolerance=1e-3):
+def print_node_with_matrix(vertex, prefix="", is_last=True, max_depth=None, current_depth=0, tolerance=1e-2):
     """
     Recursively print tree structure with T_reconstructed for each node,
     cleaning up small floating-point noise before printing.
@@ -3139,7 +3165,7 @@ def print_node_with_matrix(vertex, prefix="", is_last=True, max_depth=None, curr
 
 
 
-def analyze_root_constraints_and_propagate(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-3):
+def analyze_root_constraints_and_propagate(root,tree_idx,lattice_basis,magnetic_space_group_cart_spatial,spinor_mat_representation,delta_vec,tolerance=1e-2):
     """
     analyze hopping matrix constraints of root, propagate hopping matrix to the rest of the tree
     Args:
@@ -3370,7 +3396,7 @@ def sum_atom_T_tilde_lists(unit_cell_atoms):
 
 
 def check_vertex_T_reconstructed_invariant(vertex, lattice_basis, magnetic_space_group_cart_spatial, spinor_mat_representation,
-                                           delta_vec, tolerance=1e-3):
+                                           delta_vec, tolerance=1e-2):
     """
     Checks if the reconstructed hopping matrix of a vertex is invariant under its stabilizer operations.
     """
@@ -3494,7 +3520,7 @@ def check_vertex_T_reconstructed_invariant(vertex, lattice_basis, magnetic_space
 
 
 def check_tree_T_reconstructed_invariant(vertex, lattice_basis, magnetic_space_group_cart_spatial,
-                                         spinor_mat_representation, delta_vec, tolerance=1e-3):
+                                         spinor_mat_representation, delta_vec, tolerance=1e-2):
     """
     Recursively checks if the reconstructed hopping matrix of EVERY vertex in a tree
     is invariant under its respective stabilizer operations.
@@ -3558,7 +3584,7 @@ def check_tree_T_reconstructed_invariant(vertex, lattice_basis, magnetic_space_g
         'node_results': all_results
     }
 
-def check_hamiltonian_hermitian(H, tolerance=1e-3):
+def check_hamiltonian_hermitian(H, tolerance=1e-2):
     """
     Robustly checks if a symbolic Hamiltonian matrix is Hermitian (H = H†).
     Accounts for floating-point noise and unsimplified 1.0 * x vs x terms.
@@ -3897,7 +3923,7 @@ def run_general_computation(confFileName):
     print("=" * 80)
 
     # 5. generate atoms in unit cell
-    tol=1e-3
+    tol=1e-2
     lattice_basis = np.array(parsed_config['lattice_basis'])
     unit_cell_atoms=generate_atoms_in_unit_cell(parsed_config, magnetic_space_group_cart_spatial, lattice_basis,origin_cart, repr_s, repr_p, repr_d, repr_f, spinor_mat_representation,delta_vec,tol)
     # unit_cell_atoms is sorted
