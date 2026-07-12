@@ -2508,75 +2508,130 @@ def get_swapping_constraints(root,tree_idx,lattice_basis,magnetic_space_group_ca
     }
 
 
+# def get_rref_numerical(matrix, tolerance=1e-2):
+#     """
+#     Computes the Reduced Row Echelon Form (RREF) of a matrix numerically.
+#     Uses scipy.linalg.lu for fast Fortran-backed Gaussian elimination (REF),
+#     followed by back-substitution to achieve RREF.
+#     """
+#     # 1. Boundary check: If the matrix is empty, return it as-is with an empty pivot list
+#     if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+#         return matrix, []
+#
+#
+#     # 2. LU Decomposition: A = P @ L @ U
+#     # P is the permutation matrix, L is the lower triangular matrix, and U is the
+#     # upper triangular matrix (which is essentially our REF).
+#     # Since elementary row operations don't change the RREF, we only need U.
+#     # P and L are not needed for the final RREF and can be ignored.
+#     P, L, U = scipy.linalg.lu(matrix)
+#     rows, cols = U.shape
+#     pivot_cols = [] # List to keep track of the column indices of the pivots
+#
+#     # current_row acts as the "placement pointer". It indicates where the next
+#     # valid (non-zero) row should be placed.
+#     current_row = 0
+#
+#     # r acts as the "scout pointer", scanning through every row in the matrix U
+#     for r in range(rows):
+#         # 3. Find the pivot: Locate indices of elements in the row whose absolute
+#         # value is greater than the tolerance. We use tolerance instead of '== 0'
+#         # to account for floating-point inaccuracies (e.g., 1e-16 is practically 0).
+#         non_zeros = np.where(np.abs(U[r, :]) > tolerance)[0]
+#
+#         # If the entire row is zeros, skip it. The 'current_row' pointer stays
+#         # in place waiting for the next row with actual data.
+#         if len(non_zeros) == 0:
+#             continue
+#
+#         # The first non-zero element's column index is our pivot column
+#         pivot_col = non_zeros[0]
+#         pivot_cols.append(pivot_col)
+#
+#         # 4. Compact the matrix (Shift rows): Push all-zero rows to the bottom and
+#         # pack valid data rows at the top. If 'r' and 'current_row' are out of sync,
+#         # it means we've passed some all-zero rows.
+#         if r != current_row:
+#             U[current_row, :] = U[r, :] # Pull the valid data row up
+#             U[r, :] = 0.0  # Clear out the old position
+#
+#         # 5. Normalize the pivot row: Divide the entire row by the pivot's value
+#         # so that the pivot becomes exactly 1.0.
+#         U[current_row, :] = U[current_row, :] / U[current_row, pivot_col]
+#
+#         # 6. Upward elimination (Back-substitution): Eliminate any non-zero elements
+#         # strictly above the current pivot to transition from REF to RREF.
+#         for i in range(current_row):
+#             factor = U[i, pivot_col] # The element directly above the pivot
+#             # If it's not zero, perform the elementary row operation:
+#             # Row(i) = Row(i) - factor * Current_Row
+#             if np.abs(factor) > tolerance:
+#                 U[i, :] -= factor * U[current_row, :]
+#         # The current row is fully processed. Move the placement pointer down
+#         # to prepare for the next valid row.
+#         current_row += 1
+#
+#     # 7. Clean up floating-point noise: After multiple arithmetic operations,
+#     # tiny non-zero values (like 2.77e-17) might appear. Force anything smaller
+#     # than the tolerance to be exactly 0.0 for a clean output matrix.
+#     U[np.abs(U) < tolerance] = 0.0
+#
+#     return U, pivot_cols
+
+
 def get_rref_numerical(matrix, tolerance=1e-2):
     """
-    Computes the Reduced Row Echelon Form (RREF) of a matrix numerically.
-    Uses scipy.linalg.lu for fast Fortran-backed Gaussian elimination (REF),
-    followed by back-substitution to achieve RREF.
+    Computes the Reduced Row Echelon Form (RREF) of a matrix numerically
+    using Gaussian elimination with partial pivoting.
     """
-    # 1. Boundary check: If the matrix is empty, return it as-is with an empty pivot list
-    if matrix.shape[0] == 0 or matrix.shape[1] == 0:
-        return matrix, []
+    # Convert to float array to prevent integer division issues
+    A = np.array(matrix, dtype=float)
+    rows, cols = A.shape
 
+    # 1. Boundary check
+    if rows == 0 or cols == 0:
+        return A, []
 
-    # 2. LU Decomposition: A = P @ L @ U
-    # P is the permutation matrix, L is the lower triangular matrix, and U is the
-    # upper triangular matrix (which is essentially our REF).
-    # Since elementary row operations don't change the RREF, we only need U.
-    # P and L are not needed for the final RREF and can be ignored.
-    P, L, U = scipy.linalg.lu(matrix)
-    rows, cols = U.shape
-    pivot_cols = [] # List to keep track of the column indices of the pivots
-
-    # current_row acts as the "placement pointer". It indicates where the next
-    # valid (non-zero) row should be placed.
+    pivot_cols = []
     current_row = 0
 
-    # r acts as the "scout pointer", scanning through every row in the matrix U
-    for r in range(rows):
-        # 3. Find the pivot: Locate indices of elements in the row whose absolute
-        # value is greater than the tolerance. We use tolerance instead of '== 0'
-        # to account for floating-point inaccuracies (e.g., 1e-16 is practically 0).
-        non_zeros = np.where(np.abs(U[r, :]) > tolerance)[0]
+    # 2. Iterate through each column to find pivots
+    for c in range(cols):
+        if current_row >= rows:
+            break
 
-        # If the entire row is zeros, skip it. The 'current_row' pointer stays
-        # in place waiting for the next row with actual data.
-        if len(non_zeros) == 0:
+        # 3. Partial Pivoting: Find the row with the largest absolute value in the current column
+        pivot_row = np.argmax(np.abs(A[current_row:rows, c])) + current_row
+
+        # If the largest value is practically zero, skip this column
+        if np.abs(A[pivot_row, c]) <= tolerance:
+            # Clean up floating point noise in this column below current_row
+            A[current_row:rows, c] = 0.0
             continue
 
-        # The first non-zero element's column index is our pivot column
-        pivot_col = non_zeros[0]
-        pivot_cols.append(pivot_col)
+        # 4. Swap the current row with the pivot row
+        if pivot_row != current_row:
+            A[[current_row, pivot_row]] = A[[pivot_row, current_row]]
 
-        # 4. Compact the matrix (Shift rows): Push all-zero rows to the bottom and
-        # pack valid data rows at the top. If 'r' and 'current_row' are out of sync,
-        # it means we've passed some all-zero rows.
-        if r != current_row:
-            U[current_row, :] = U[r, :] # Pull the valid data row up
-            U[r, :] = 0.0  # Clear out the old position
+        pivot_cols.append(c)
 
-        # 5. Normalize the pivot row: Divide the entire row by the pivot's value
-        # so that the pivot becomes exactly 1.0.
-        U[current_row, :] = U[current_row, :] / U[current_row, pivot_col]
+        # 5. Normalize the pivot row
+        A[current_row, :] /= A[current_row, c]
 
-        # 6. Upward elimination (Back-substitution): Eliminate any non-zero elements
-        # strictly above the current pivot to transition from REF to RREF.
-        for i in range(current_row):
-            factor = U[i, pivot_col] # The element directly above the pivot
-            # If it's not zero, perform the elementary row operation:
-            # Row(i) = Row(i) - factor * Current_Row
-            if np.abs(factor) > tolerance:
-                U[i, :] -= factor * U[current_row, :]
-        # The current row is fully processed. Move the placement pointer down
-        # to prepare for the next valid row.
+        # 6. Eliminate all other rows (both ABOVE and BELOW the pivot)
+        for i in range(rows):
+            if i != current_row:
+                factor = A[i, c]
+                if np.abs(factor) > tolerance:
+                    A[i, :] -= factor * A[current_row, :]
+
+        # Move to the next row
         current_row += 1
 
-    # 7. Clean up floating-point noise: After multiple arithmetic operations,
-    # tiny non-zero values (like 2.77e-17) might appear. Force anything smaller
-    # than the tolerance to be exactly 0.0 for a clean output matrix.
-    U[np.abs(U) < tolerance] = 0.0
+    # 7. Clean up floating-point noise globally
+    A[np.abs(A) < tolerance] = 0.0
 
-    return U, pivot_cols
+    return A, pivot_cols
 
 
 def split_complex_symbols(T_matrix):
