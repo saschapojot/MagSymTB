@@ -1,5 +1,5 @@
 # Hopping Parameter Input File
-# Generated: 2026-07-06 19:44:20
+# Generated: 2026-07-14 21:17:04
 #
 # Instructions:
 # 1. Fill in numerical values after the '=' symbol
@@ -31,7 +31,7 @@ im_T^{1}_{4dx2-y2_down,4dxy_down}=
 re_T^{1}_{4dxy_down,4dxy_down}=0.218 
 im_T^{1}_{4dxy_down,4dxy_down}=
 # ----------------------------------------------------------------------
-re_T^{1}_{4dz2_down,4dx2-y2_down}=0.507 
+re_T^{1}_{4dz2_down,4dx2-y2_down}=0.507
 im_T^{1}_{4dz2_down,4dx2-y2_down}=
 # ----------------------------------------------------------------------
 re_T^{1}_{4dz2_down,4dxy_down}=-0.401 
@@ -60,8 +60,8 @@ im_T^{3}_{4dx2-y2_down,4dx2-y2_down}=
 re_T^{3}_{4dx2-y2_down,4dxy_down}=
 im_T^{3}_{4dx2-y2_down,4dxy_down}=
 # ----------------------------------------------------------------------
-re_T^{3}_{4dxy_down,4dx2-y2_down}=
-im_T^{3}_{4dxy_down,4dx2-y2_down}=
+re_T^{3}_{4dxy_down,4dxy_down}=
+im_T^{3}_{4dxy_down,4dxy_down}=
 # ----------------------------------------------------------------------
 re_T^{3}_{4dz2_down,4dx2-y2_down}=
 im_T^{3}_{4dz2_down,4dx2-y2_down}=
