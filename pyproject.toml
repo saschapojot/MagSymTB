@@ -12,16 +12,16 @@ authors = [
     { name = "Your Name", email = "your.email@example.com" }
 ]
 dependencies = [
-    "numpy==2.5.0",
-    "sympy==1.14.0",
-    "scipy==1.17.1",
+    "numpy",
+    "sympy",
+    "scipy",
     "matplotlib"
 ]
 
 [project.scripts]
 # This section creates your command-line tools!
 # Format: "terminal-command = package.module:function"
-mstb-init-from-cif = "magsymtb.cli:run_init_from_cif"
+mstb-init-conf-from-cif = "magsymtb.cli:run_init_from_cif"
 mstb-general = "magsymtb.cli:run_general"
 mstb-run-diag="magsymtb.cli:run_diagonalization"
 mstb-run-plot-band="magsymtb.cli:run_plot_band"

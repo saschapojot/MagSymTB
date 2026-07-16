@@ -762,7 +762,7 @@ def subroutine_generate_conf_file(cif_file_name, tol):
 
     # --- Write to File ---
     out_dir = Path(cif_file_name).resolve().parent
-    out_conf_file = str(out_dir / f"{data_name}.conf")
+    out_conf_file = str(out_dir / f"conf.{data_name}.conf")
     with open(out_conf_file, 'w', encoding='utf-8') as f:
         f.writelines(text_list)
         print(f"Successfully generated configuration file: {out_conf_file}")
