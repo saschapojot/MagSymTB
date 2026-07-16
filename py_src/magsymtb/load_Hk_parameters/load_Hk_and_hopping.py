@@ -379,7 +379,7 @@ def load_hamiltonian_data(pickle_path: str, verbose: bool = True) -> dict:
         raise Exception(f"Unexpected error loading Hamiltonian data: {e}")
 
 
-def load_hamiltonian_and_hopping_from_path(conf_file_path: str, verbose: bool = True) ->  tuple[dict, dict]:
+def load_hamiltonian_and_hopping_from_path(current_dir: str, verbose: bool = True) ->  tuple[dict, dict]:
     """
     Complete pipeline to load Hamiltonian data and hopping parameters from a configuration file path.
     Args:
@@ -392,22 +392,19 @@ def load_hamiltonian_and_hopping_from_path(conf_file_path: str, verbose: bool = 
     # ==============================================================================
     # STEP 1: Validate input path
     # ==============================================================================
-    conf_path = Path(conf_file_path)
-    if not conf_path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {conf_file_path}")
 
     if verbose:
         print("\n" + "=" * 80)
         print("LOADING HAMILTONIAN DATA")
         print("=" * 80)
-        print(f"Configuration file: {conf_path}")
+
 
     # ==============================================================================
     # STEP 2: Determine data directory and construct file paths
     # ==============================================================================
     # The Hamiltonian data is stored in the same directory as the config file
     try:
-        data_dir = get_data_directory(conf_file_path)
+        data_dir = current_dir
         if verbose:
             print(f"Data directory: {data_dir}")
     except FileNotFoundError as e:
@@ -578,8 +575,8 @@ def substitute_hopping_parameters(hamiltonian_data: dict, hopping_params: dict, 
 
     return hamiltonian_with_values
 
-def subroutine_get_Hk(confFileName,verbose=True):
+def subroutine_get_Hk(current_dir,verbose=True):
 
-    h, hop = load_hamiltonian_and_hopping_from_path(confFileName, verbose)
+    h, hop = load_hamiltonian_and_hopping_from_path(current_dir, verbose)
     Hk = substitute_hopping_parameters(h, hop, True)
     return Hk
