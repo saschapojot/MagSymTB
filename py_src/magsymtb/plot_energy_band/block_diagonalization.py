@@ -199,7 +199,7 @@ def diagonalize_all_Hk_matrices(Hk_matrices_all, num_processes=None):
     all_eigenvectors = np.concatenate(eigenvectors_list, axis=0)
     return all_eigenvalues, all_eigenvectors
 
-def subroutine_eigen_problem_for_energy_band_plot(confFileName,num_processes=None,interpolate_point_num=15,verbose=True):
+def subroutine_eigen_problem_for_energy_band_plot(num_processes=None,interpolate_point_num=15,verbose=True):
     """
     Orchestrates the complete calculation of energy band plotting for a given system configuration.
     This subroutine acts as the main driver. It performs the following steps:
@@ -211,7 +211,6 @@ def subroutine_eigen_problem_for_energy_band_plot(confFileName,num_processes=Non
     6. Saves all relevant plotting data to a pickle file in the same directory as the input config.
 
     Args:
-        confFileName: Path to the configuration file of crystal (e.g., './computation_examples/hBN/hBN_primitive.conf').
         num_processes: Number of CPU cores for parallel diagonalization. If None, uses all available.
         interpolate_point_num: Number of points to interpolate between high-symmetry points in the BZ path.
         verbose: If True, prints status messages to the console.
@@ -222,7 +221,9 @@ def subroutine_eigen_problem_for_energy_band_plot(confFileName,num_processes=Non
     """
     # 1. Load the symbolic Hamiltonian (Hk)
     # This reads the hopping parameters and lattice configuration to build the symbolic matrix.
-    Hk = subroutine_get_Hk(confFileName,verbose)
+    # 1. Identify the current directory and find the .conf file
+    current_dir = Path.cwd()
+    Hk = subroutine_get_Hk(current_dir,verbose)
 
     # 2. Generate k-points path
     # This loads the path through high-symmetry points in the Brillouin Zone
@@ -230,7 +231,7 @@ def subroutine_eigen_problem_for_energy_band_plot(confFileName,num_processes=Non
     # 'quantum_numbers_k' contains the actual  k0, k1, k2 coordinates (k0 for 1d; k0, k1 for 2d; k0, k1, k2 for 3d) for every point in the path.
     # 'all_distances' is used for the x-axis when plotting the bands (cumulative distance in k-space).
     all_coords, all_distances, high_symmetry_indices, high_symmetry_labels, quantum_numbers_k, processed_input_data,name = subroutine_get_interpolated_points_in_BZ_and_quantum_number_k(
-        confFileName,interpolate_point_num)
+        current_dir,interpolate_point_num)
 
     # 3. Convert Symbolic Hk to Numerical Function
     # Validates dimensions and creates a fast lambdified function for matrix generation.
@@ -246,8 +247,7 @@ def subroutine_eigen_problem_for_energy_band_plot(confFileName,num_processes=Non
     t_diag_end = datetime.now()
     print("diagonalization time: ", t_diag_end-t_diag_start)
     # Extract the parent directory from the configuration file path
-    conf_file_path = Path(confFileName)
-    directory = conf_file_path.parent
+    directory = current_dir
     # Construct the output pickle file path
     out_pickle_file_name = str(directory / plotting_band_data_pkl_file_name)
     # print(f"all_eigenvalues={all_eigenvalues}")

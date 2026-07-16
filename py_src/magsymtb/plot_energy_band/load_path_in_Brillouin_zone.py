@@ -425,7 +425,7 @@ def obtain_quantum_number_k(all_coords,processed_input_data):
     return quantum_numbers_k
 
 
-def subroutine_get_interpolated_points_in_BZ_and_quantum_number_k(confFileName,interpolate_point_num=15):
+def subroutine_get_interpolated_points_in_BZ_and_quantum_number_k(current_dir,interpolate_point_num=15):
     """
     Main driver function to load configuration, interpolate the path in the Brillouin Zone,
     and calculate the corresponding quantum numbers.
@@ -439,7 +439,7 @@ def subroutine_get_interpolated_points_in_BZ_and_quantum_number_k(confFileName,i
     6. Projects these points onto real-space lattice vectors to get quantum numbers.
 
     Args:
-        confFileName: Path to the main configuration file (used to locate the data directory).
+        current_dir: Path to the computation directory (used to locate the data directory).
         interpolate_point_num: Number of points to interpolate per segment between high-symmetry points.
 
 
@@ -453,7 +453,7 @@ def subroutine_get_interpolated_points_in_BZ_and_quantum_number_k(confFileName,i
 
     """
     # 1. Resolve the directory containing data files based on the config file path
-    conf_dir = get_data_directory(confFileName)
+    conf_dir = current_dir
 
     # 2. Locate and validate input files (BZ_path.conf and preprocessed input)
     BZ_path_and_input_files=get_file_paths(conf_dir)

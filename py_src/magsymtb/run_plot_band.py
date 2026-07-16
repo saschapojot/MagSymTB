@@ -9,9 +9,9 @@ import sympy as sp
 import matplotlib.pyplot as plt
 from magsymtb.name_conventions import plotting_band_data_pkl_file_name
 
-def load_plotting_band_data(confFileName):
-    conf_file_path = Path(confFileName)
-    directory = conf_file_path.parent
+def load_plotting_band_data():
+    current_dir = Path.cwd()
+    directory = current_dir
     data_for_plotting_file_name = str(directory / plotting_band_data_pkl_file_name)
     try:
         with open(data_for_plotting_file_name, 'rb') as f:
@@ -32,11 +32,11 @@ def main():
     # Set up the argument parser
     parser = argparse.ArgumentParser(description="Plot energy bands from diagonalization data.")
 
-    parser.add_argument(
-        "confFileName",
-        type=str,
-        help="Path to the input .conf file (e.g., /path/to/mc.conf)"
-    )
+    # parser.add_argument(
+    #     "confFileName",
+    #     type=str,
+    #     help="Path to the input .conf file (e.g., /path/to/mc.conf)"
+    # )
 
     # Added optional arguments for y-axis limits (previously hardcoded)
     parser.add_argument(
@@ -56,7 +56,7 @@ def main():
     data_non_existent_err_code = 21
 
     # Load data
-    data_for_plotting = load_plotting_band_data(args.confFileName)
+    data_for_plotting = load_plotting_band_data()
     if data_for_plotting is None:
         print("Error: Could not load data. Exiting.")
         sys.exit(data_non_existent_err_code)
@@ -91,8 +91,8 @@ def main():
     plt.tight_layout()
 
     # Save the plot
-    conf_file_path = Path(args.confFileName)
-    base_directory = conf_file_path.parent
+    current_dir = Path.cwd()
+    base_directory = current_dir
     out_pic_file_name = str(base_directory / "band.png")
     plt.savefig(out_pic_file_name, bbox_inches='tight')
     print(f"Band structure plot successfully saved to: {out_pic_file_name}")

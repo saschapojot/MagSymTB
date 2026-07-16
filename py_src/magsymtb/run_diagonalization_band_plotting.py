@@ -13,11 +13,11 @@ def main():
     )
 
     # Required positional argument
-    parser.add_argument(
-        "confFileName",
-        type=str,
-        help="Path to the input .conf file (e.g., /path/to/mc.conf)"
-    )
+    # parser.add_argument(
+    #     "confFileName",
+    #     type=str,
+    #     help="Path to the input .conf file (e.g., /path/to/mc.conf)"
+    # )
 
     # Optional arguments to replace the hardcoded values
     parser.add_argument(
@@ -46,7 +46,6 @@ def main():
 
     # Run the diagonalization subroutine using the parsed arguments
     out_pickle_file_name = subroutine_eigen_problem_for_energy_band_plot(
-        args.confFileName,
         args.num_processes,
         args.interpolate_point_num,
         args.verbose
