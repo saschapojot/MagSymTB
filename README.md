@@ -3,7 +3,7 @@
 pip install -e .
 
 1. cd examples/XXX/
-2. mstb-init-from-cif YYY.cif
+2. mstb-init-conf-from-cif YYY.cif
 3. fill in conf.YYY.conf
 4. mstb-general YYY.conf
 5. fill in hopping_parameters.txt
