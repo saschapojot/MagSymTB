@@ -7,5 +7,5 @@ pip install -e .
 3. fill in conf.YYY.conf
 4. mstb-general YYY.conf
 5. fill in hopping_parameters.txt
-6. mstb-run-diag YYY.conf
-7. mstb-run-plot-band YYY.conf 
+6. mstb-run-diag 
+7. mstb-run-plot-band
