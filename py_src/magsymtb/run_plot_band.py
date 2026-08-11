@@ -110,7 +110,7 @@ def main():
     formatted_labels = [format_high_symmetry_label(lbl) for lbl in high_symmetry_labels]
 
     # --- Plotting bands ---
-    plt.figure(figsize=(6, 5))
+    plt.figure(figsize=(4, 5))
     num_bands = all_eigenvalues.shape[1]
 
     for i in range(0, num_bands):
