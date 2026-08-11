@@ -1,6 +1,6 @@
 # CIF file created by FINDTeYM, version 7.1.3
 
-data_WTe2_60
+data_WTe2
 _audit_creation_method FINDTeYM
 
 _cell_length_a     3.1930000000

@@ -1,6 +1,6 @@
 # CIF file created by FINDSYM, version 7.1.3
 
-data_MoS2_60
+data_MoS2
 _audit_creation_method FINDSYM
 
 _cell_length_a     3.1930000000
