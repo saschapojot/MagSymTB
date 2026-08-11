@@ -3,7 +3,7 @@ import argparse
 import pickle
 from pathlib import Path
 from datetime import datetime
-
+import re
 import numpy as np
 import sympy as sp
 import matplotlib.pyplot as plt
@@ -24,6 +24,45 @@ def load_plotting_band_data():
     except Exception as e:
         print(f"An error occurred while loading the pickle file: {e}")
         return None
+
+def format_chemical_formula(formula: str) -> str:
+    """
+    Converts plain text chemical formulas (e.g., 'Bi2Se3', 'Fe2O3', 'La2CuO4')
+    into Matplotlib MathText with upright symbols and subscript numbers.
+    """
+    subscripted = re.sub(r'(\d+)', r'_{\1}', formula)
+    return f"$\\mathrm{{{subscripted}}}$"
+
+def format_high_symmetry_label(label: str) -> str:
+    """
+    Converts Latin names for Greek letters (e.g., 'Gamma', 'DELTA', 'Sigma_1')
+    into LaTeX Greek MathText (e.g., '$\\Gamma$', '$\\Delta$', '$\\Sigma_1$').
+    """
+
+    # List of common Greek letter names in solid-state physics
+    greek_words = [
+        'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Phi', 'Psi', 'Omega',
+        'gamma', 'delta', 'theta', 'lambda', 'xi', 'pi', 'sigma', 'phi', 'psi', 'omega',
+        'alpha', 'beta', 'eta', 'kappa', 'mu', 'nu', 'rho', 'tau', 'chi'
+    ]
+
+    # Valid uppercase LaTeX commands in Matplotlib MathText
+    capital_latex = {'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Phi', 'Psi', 'Omega'}
+
+    def replace_greek(match):
+        word = match.group(0)
+        title_word = word.capitalize()
+        if title_word in capital_latex:
+            return f"\\{title_word}"
+        else:
+            return f"\\{word.lower()}"
+
+    pattern = r'\b(' + '|'.join(greek_words) + r')\b'
+    formatted_label, count = re.subn(pattern, replace_greek, label, flags=re.IGNORECASE)
+
+    if count > 0:
+        return f"${formatted_label}$"
+    return label
 
 
 def main():
@@ -67,6 +106,9 @@ def main():
     high_symmetry_labels = data_for_plotting["high_symmetry_labels"]
     all_eigenvalues = data_for_plotting["all_eigenvalues"]
 
+    # --- Format high symmetry labels ---
+    formatted_labels = [format_high_symmetry_label(lbl) for lbl in high_symmetry_labels]
+
     # --- Plotting bands ---
     plt.figure(figsize=(6, 5))
     num_bands = all_eigenvalues.shape[1]
@@ -81,20 +123,20 @@ def main():
     valid_indices = [i for i in high_symmetry_indices if i < len(all_distances)]
     tick_locations = [all_distances[i] for i in valid_indices]
 
-    plt.xticks(tick_locations, high_symmetry_labels, fontsize=14)
+    plt.xticks(tick_locations, formatted_labels, fontsize=14)
 
     plt.xlim(all_distances[0], all_distances[-1])
     plt.ylim(args.ymin, args.ymax)
 
-    plt.title(f"{name}", fontsize=24)
+    plt.title(f"{format_chemical_formula(name)}", fontsize=24)
     plt.grid(alpha=0.3)
     plt.tight_layout()
 
     # Save the plot
     current_dir = Path.cwd()
     base_directory = current_dir
-    out_pic_file_name = str(base_directory / "band.png")
-    plt.savefig(out_pic_file_name, bbox_inches='tight')
+    out_pic_file_name = str(base_directory / "band.pdf")
+    plt.savefig(out_pic_file_name, bbox_inches='tight', pad_inches=0)
     print(f"Band structure plot successfully saved to: {out_pic_file_name}")
 
 if __name__ == "__main__":
