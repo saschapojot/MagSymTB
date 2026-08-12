@@ -25,6 +25,45 @@ def load_plotting_band_data():
         print(f"An error occurred while loading the pickle file: {e}")
         return None
 
+def format_chemical_formula(formula: str) -> str:
+    """
+    Converts plain text chemical formulas (e.g., 'Bi2Se3', 'Fe2O3', 'La2CuO4')
+    into Matplotlib MathText with upright symbols and subscript numbers.
+    """
+    subscripted = re.sub(r'(\d+)', r'_{\1}', formula)
+    return f"$\\mathrm{{{subscripted}}}$"
+
+def format_high_symmetry_label(label: str) -> str:
+    """
+    Converts Latin names for Greek letters (e.g., 'Gamma', 'DELTA', 'Sigma_1')
+    into LaTeX Greek MathText (e.g., '$\\Gamma$', '$\\Delta$', '$\\Sigma_1$').
+    """
+
+    # List of common Greek letter names in solid-state physics
+    greek_words = [
+        'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Phi', 'Psi', 'Omega',
+        'gamma', 'delta', 'theta', 'lambda', 'xi', 'pi', 'sigma', 'phi', 'psi', 'omega',
+        'alpha', 'beta', 'eta', 'kappa', 'mu', 'nu', 'rho', 'tau', 'chi'
+    ]
+
+    # Valid uppercase LaTeX commands in Matplotlib MathText
+    capital_latex = {'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Phi', 'Psi', 'Omega'}
+
+    def replace_greek(match):
+        word = match.group(0)
+        title_word = word.capitalize()
+        if title_word in capital_latex:
+            return f"\\{title_word}"
+        else:
+            return f"\\{word.lower()}"
+
+    pattern = r'\b(' + '|'.join(greek_words) + r')\b'
+    formatted_label, count = re.subn(pattern, replace_greek, label, flags=re.IGNORECASE)
+
+    if count > 0:
+        return f"${formatted_label}$"
+    return label
+
 
 import re
 
