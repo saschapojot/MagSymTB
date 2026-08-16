@@ -166,7 +166,7 @@ def magnetic_space_group_representation_D_orbitals(R):
     Original function: GetSymD(R) in cd/SymGroup.py
 
     The d orbitals transform as quadratic functions of coordinates:
-    d_xy, d_yz, d_xz, d_(x²-y²), d_(3z²-r²)
+    d_xy, d_yz, d_xz, d_(x²-y²), d_z2
 
     This function computes the 5x5 representation matrix showing how
     the rotation R transforms the d orbital basis.
