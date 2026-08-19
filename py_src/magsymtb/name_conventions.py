@@ -83,4 +83,5 @@ plotting_band_data_pkl_file_name="plotting_band_data.pkl"
 
 relations_file_name="dependent_hopping_relations.txt"
 
+tree_pkl_file_name="all_trees.pkl"
 
