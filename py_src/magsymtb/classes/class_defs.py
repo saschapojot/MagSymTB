@@ -445,6 +445,7 @@ class vertex():
         self.parent = parent  # Reference to parent vertex (None for root)
         # NOT deep copied, because this is reference (reference in C++ sense, pointer in C sense)
         # Forms bidirectional directed tree: parent ↔ children
+        self.line_type=None # for visualization
 
     def add_child(self, child_vertex):
         """

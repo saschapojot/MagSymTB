@@ -25,6 +25,7 @@ mstb-init-conf-from-cif = "magsymtb.cli:run_init_from_cif"
 mstb-general = "magsymtb.cli:run_general"
 mstb-run-diag="magsymtb.cli:run_diagonalization"
 mstb-run-plot-band="magsymtb.cli:run_plot_band"
+mstb-run-2d-plot-trees="magsymtb.cli:run_2d_plot_trees"
 
 [tool.setuptools.packages.find]
 # This tells the builder that your actual package code is inside 'py_src'
