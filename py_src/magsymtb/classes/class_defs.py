@@ -422,6 +422,8 @@ class vertex():
         self.is_root = (hopping.operation_idx == identity_idx)  # Boolean flag identifying root vertex
         # Root vertex contains identity operation
         # Starting vertex of hopping matrix T propagation
+        self.is_equivalence_class_root= (hopping.operation_idx == identity_idx) # for plotting
+
 
         self.children = []  # List of REFERENCES to child vertex objects
         # CRITICAL: These are references (pointers), NOT deep copies!

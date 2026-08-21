@@ -196,24 +196,31 @@ def draw_arrows_and_circles(root_vertex, ax, radius, a0, a1, a2, tolerance=1e-5)
     center_atom = root_vertex.hopping.to_atom
     cx, cy, cz = get_real_coords(center_atom, a0, a1, a2)
 
+    # Large truncation radius circle (pink dashed)
     circle = Circle((cx, cy), radius, color='pink', fill=False,
-                    linestyle='--', linewidth=1, zorder=8)
+                    linestyle='--', linewidth=3, zorder=8)
     ax.add_patch(circle)
     ax.scatter([cx], [cy], c='pink', s=5, zorder=15)
-
+    #Small green circle around center atom ---
+    center_marker = Circle((cx, cy), 0.8, color='green', fill=False,
+                           linewidth=2, zorder=25)
+    ax.add_patch(center_marker)
     def _traverse_draw(node):
         hop = node.hopping
         start_x, start_y, start_z = get_real_coords(hop.from_atom, a0, a1, a2)
         end_x, end_y, end_z = get_real_coords(hop.to_atom, a0, a1, a2)
         # Determine Style: Root is solid, everything else is dotted
-        if node.is_root:
+        is_eq_root = getattr(node, 'is_equivalence_class_root', node.is_root)
+        if is_eq_root:
             arrow_style = 'solid'
         else:
             arrow_style = 'dotted'
 
-        if getattr(hop, 'line_type', 0) == 1:
+        # Set color: root is green, otherwise based on line_type (1: blue, 0: crimson)
+        if node.is_root:
+            arrow_color = 'cyan'
+        elif getattr(hop, 'line_type', 0) == 1:
             arrow_color = 'blue'
-
         else:
             arrow_color = 'crimson'
 
@@ -223,10 +230,10 @@ def draw_arrows_and_circles(root_vertex, ax, radius, a0, a1, a2, tolerance=1e-5)
         else:
             arrow = FancyArrowPatch((start_x, start_y), (end_x, end_y),
                                     arrowstyle='-|>',
-                                    mutation_scale=10,
+                                    mutation_scale=18,
                                     color=arrow_color,
                                     linestyle=arrow_style,
-                                    linewidth=1,
+                                    linewidth=1.8,
                                     zorder=12)
             ax.add_patch(arrow)
 
@@ -346,12 +353,15 @@ def plot_single_root_tree(root_vertex, root_index, parsed_config, unit_cell_atom
 
     hop = root_vertex.hopping
     title_str = f"Tree {root_index}: {hop.to_atom.position_name} <- {hop.from_atom.position_name} (d={hop.distance:.4f})"
-    ax.set_title(title_str)
+    ax.set_title(title_str, fontsize=16, pad=15)
 
     # Save Plot
     filename = f"lattice_grid_tree_{root_index}.png"
+    filename_svg = f"lattice_grid_tree_{root_index}.svg"
     output_file = os.path.join(output_dir, filename)
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    output_file_svg=os.path.join(output_dir, filename_svg)
+    plt.savefig(output_file_svg, bbox_inches='tight')
     print(f"Plot saved to: {output_file}")
     plt.close(fig)
 
