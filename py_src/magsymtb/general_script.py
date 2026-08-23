@@ -468,13 +468,13 @@ def print_tree(root, prefix="", is_last=True, show_details=True, max_depth=None,
     to_cell = f"[{hop.to_atom.n0},{hop.to_atom.n1},{hop.to_atom.n2}]"
     from_cell = f"[{hop.from_atom.n0},{hop.from_atom.n1},{hop.from_atom.n2}]"
     basic_info = f"{hop.to_atom.wyckoff_instance_id}{to_cell} ← {hop.from_atom.wyckoff_instance_id}{from_cell}"
-
+    delta = hop.to_atom.delta_vec[hop.operation_idx]
     # Print main node line
     if show_details:
         print(f"{prefix}{connector}{node_label}: {basic_info}, "
-              f"op={hop.operation_idx}, dist={hop.distance:.4f}")
+              f"op={hop.operation_idx}, dist={hop.distance:.4f}, delta={delta}")
     else:
-        print(f"{prefix}{connector}{node_label}: op={hop.operation_idx}")
+        print(f"{prefix}{connector}{node_label}: op={hop.operation_idx}, delta={delta}")
 
     # Print additional details if requested and this is root
     if show_details and root.is_root and current_depth == 0:
@@ -3166,7 +3166,8 @@ def print_node_with_matrix(vertex, prefix="", is_last=True, max_depth=None, curr
     basic_info = f"{hop.to_atom.wyckoff_instance_id}{to_cell} ← {hop.from_atom.wyckoff_instance_id}{from_cell}"
 
     # Print main node line
-    print(f"{prefix}{connector}{node_label}: {basic_info}, op={hop.operation_idx}, d={hop.distance:.4f}")
+    delta = hop.to_atom.delta_vec[hop.operation_idx]
+    print(f"{prefix}{connector}{node_label}: {basic_info}, op={hop.operation_idx}, d={hop.distance:.4f}, delta={delta}")
 
     # Determine detail prefix
     if vertex.is_root:
