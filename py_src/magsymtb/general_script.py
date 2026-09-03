@@ -11,14 +11,15 @@ import re
 import argparse
 
 from magsymtb.name_conventions import orbital_map, processed_input_pkl_file_name, type_linear, type_hermitian, H_latex_file_name, \
-    H_html_file_name, H_pkl_file_name, hopping_parameters_template_file_name,representations_all_file_name,relations_file_name
+    H_html_file_name, H_pkl_file_name, hopping_parameters_template_file_name,representations_all_file_name,relations_file_name, \
+    tree_pkl_file_name
 
 from magsymtb.parse_files.parse_conf import parse_configuration
 from magsymtb.parse_files.sanity_check import run_sanity_check
 from magsymtb.symmetry.generate_magnetic_space_group_representations import generate_representations
 from magsymtb.symmetry.complete_orbitals import run_complete_orbitals
 from magsymtb.classes.class_defs import frac_to_cartesian, atomIndex, hopping, vertex, T_tilde_total
-
+from magsymtb.tree_save_load.load_save_tree import save_tree_structures
 
 sp.init_printing(use_unicode=False, wrap_line=False)
 
@@ -467,13 +468,13 @@ def print_tree(root, prefix="", is_last=True, show_details=True, max_depth=None,
     to_cell = f"[{hop.to_atom.n0},{hop.to_atom.n1},{hop.to_atom.n2}]"
     from_cell = f"[{hop.from_atom.n0},{hop.from_atom.n1},{hop.from_atom.n2}]"
     basic_info = f"{hop.to_atom.wyckoff_instance_id}{to_cell} ← {hop.from_atom.wyckoff_instance_id}{from_cell}"
-
+    delta = hop.to_atom.delta_vec[hop.operation_idx]
     # Print main node line
     if show_details:
         print(f"{prefix}{connector}{node_label}: {basic_info}, "
-              f"op={hop.operation_idx}, dist={hop.distance:.4f}")
+              f"op={hop.operation_idx}, dist={hop.distance:.4f}, delta={delta}")
     else:
-        print(f"{prefix}{connector}{node_label}: op={hop.operation_idx}")
+        print(f"{prefix}{connector}{node_label}: op={hop.operation_idx}, delta={delta}")
 
     # Print additional details if requested and this is root
     if show_details and root.is_root and current_depth == 0:
@@ -3165,7 +3166,8 @@ def print_node_with_matrix(vertex, prefix="", is_last=True, max_depth=None, curr
     basic_info = f"{hop.to_atom.wyckoff_instance_id}{to_cell} ← {hop.from_atom.wyckoff_instance_id}{from_cell}"
 
     # Print main node line
-    print(f"{prefix}{connector}{node_label}: {basic_info}, op={hop.operation_idx}, d={hop.distance:.4f}")
+    delta = hop.to_atom.delta_vec[hop.operation_idx]
+    print(f"{prefix}{connector}{node_label}: {basic_info}, op={hop.operation_idx}, d={hop.distance:.4f}, delta={delta}")
 
     # Determine detail prefix
     if vertex.is_root:
@@ -4106,7 +4108,7 @@ def run_general_computation(confFileName):
         # Use imap for progress tracking (optional) or map for simplicity
         results = pool.map(analyze_root_constraints_worker, args_list)
     print("Parallel processing complete!")
-    roots_solved=[root for _,root in results]
+    roots_solved=[root for _,root in results]#roots_solved keep sorted in python Pool.map()
     print(f"✓ Analyzed {len(roots_solved)} roots in parallel")
     print("=" * 80)
     for tree_idx, root in enumerate(roots_solved):
@@ -4203,6 +4205,14 @@ def run_general_computation(confFileName):
     print(f"1. Edit the file: {param_input_file}")
     print(f"2. Fill in values for all independent parameters")
     print("=" * 80)
+
+
+    ##13. save tree structure
+    tree_metadata=deepcopy(preprocessing_data)
+    tree_metadata["unit_cell_atoms"]=deepcopy(unit_cell_atoms)
+    tree_metadata["radius"]=radius
+    tree_metadata["search_range"]=search_range
+    save_tree_structures(roots_solved,tree_pkl_file_name,tree_metadata)
 
 
 

@@ -420,8 +420,11 @@ class vertex():
         # String is immutable, safe to assign directly
 
         self.is_root = (hopping.operation_idx == identity_idx)  # Boolean flag identifying root vertex
+        self.was_root_before_graft=(hopping.operation_idx == identity_idx)# was root before linear/Hermitian graft
         # Root vertex contains identity operation
         # Starting vertex of hopping matrix T propagation
+        self.is_equivalence_class_root= (hopping.operation_idx == identity_idx) # for plotting
+
 
         self.children = []  # List of REFERENCES to child vertex objects
         # CRITICAL: These are references (pointers), NOT deep copies!
@@ -445,6 +448,7 @@ class vertex():
         self.parent = parent  # Reference to parent vertex (None for root)
         # NOT deep copied, because this is reference (reference in C++ sense, pointer in C sense)
         # Forms bidirectional directed tree: parent ↔ children
+        self.line_type=None # for visualization
 
     def add_child(self, child_vertex):
         """
