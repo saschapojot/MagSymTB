@@ -3,6 +3,7 @@ from magsymtb.general_script import main as general_main
 from magsymtb.run_diagonalization_band_plotting import main as diagonalization_main
 from magsymtb.run_plot_band import main as plot_band_main
 from magsymtb.run_2d_plot_trees import main as plot_2d_tree_main
+from magsymtb.all_trees_same_color import main as all_trees_main
 
 def run_init_from_cif():
     """This function is triggered by the 'mstb-init-from-cif' command."""
